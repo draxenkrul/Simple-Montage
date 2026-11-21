@@ -4,6 +4,7 @@ The horizontal axis is *source* time. Kept segments are drawn as blocks
 (coloured by speed); cut-out parts are hatched.
 
 Overlay clips (videos shown on top) appear on a lane under the main track.
+When several videos are combined, their boundaries and names are shown.
 
 Once the video is split or cut, every kept segment shows a small export (⬇)
 button. Right-click opens a menu to export a segment, all segments, or a
@@ -49,6 +50,9 @@ class TimelineWidget(QWidget):
     export_segment_requested = Signal(int)
     export_all_requested = Signal()
     export_cut_requested = Signal(float, float)  # a cut-out part: start, end
+    add_clip_requested = Signal()
+    move_clip_requested = Signal(int, int)  # clip index, -1 earlier / +1 later
+    remove_clip_requested = Signal(int)
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -192,6 +196,7 @@ class TimelineWidget(QWidget):
                 p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "  ".join(tags))
             self._paint_export_button(p, i)
 
+        self._paint_clip_boundaries(p, track)
         self._paint_overlays(p)
         self._paint_marks(p, track)
 
@@ -218,6 +223,26 @@ class TimelineWidget(QWidget):
                 label = label[2:]
             p.drawText(int(x) + 3, RULER_H - 8, label)
             t += step
+
+    def _paint_clip_boundaries(self, p: QPainter, track: QRectF) -> None:
+        if len(self._tl.sources) < 2:
+            return
+        for k, (offset, src) in enumerate(zip(self._tl.clip_offsets, self._tl.sources)):
+            x = self._x(offset)
+            if k > 0:
+                p.setPen(QPen(QColor("#ffffff"), 2, Qt.PenStyle.DashLine))
+                p.drawLine(QPointF(x, track.top() - 4), QPointF(x, track.bottom() + 4))
+            width = self._x(offset + src.duration) - x
+            if width > 50:
+                name = f"{k + 1}. {Path(src.path).name}"
+                text = p.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, int(width) - 40)
+                tw = p.fontMetrics().horizontalAdvance(text) + 8
+                label = QRectF(max(x, 0) + 4, track.top() + 3, tw, p.fontMetrics().height() + 2)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor(0, 0, 0, 120))
+                p.drawRoundedRect(label, 3, 3)
+                p.setPen(QColor("#ffffff"))
+                p.drawText(label, Qt.AlignmentFlag.AlignCenter, text)
 
     def _paint_export_button(self, p: QPainter, i: int) -> None:
         r = self._export_button_rect(i)
@@ -326,8 +351,17 @@ class TimelineWidget(QWidget):
         if len(self._tl.segments) > 1:
             menu.addAction(f"Export all {len(self._tl.segments)} segments as separate files…",
                            self.export_all_requested.emit)
-        if not menu.isEmpty():
-            menu.exec(event.globalPos())
+        menu.addSeparator()
+        menu.addAction("Add a video to the end…", self.add_clip_requested.emit)
+        k = self._tl.clip_at(t)
+        if k is not None and len(self._tl.sources) > 1:
+            name = Path(self._tl.sources[k].path).name
+            earlier = menu.addAction(f"Move clip “{name}” earlier", lambda: self.move_clip_requested.emit(k, -1))
+            earlier.setEnabled(k > 0)
+            later = menu.addAction(f"Move clip “{name}” later", lambda: self.move_clip_requested.emit(k, 1))
+            later.setEnabled(k < len(self._tl.sources) - 1)
+            menu.addAction(f"Remove clip “{name}” from the timeline", lambda: self.remove_clip_requested.emit(k))
+        menu.exec(event.globalPos())
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if self._tl.duration <= 0:

@@ -135,3 +135,22 @@ def test_overlay_args_put_inputs_after_main():
     i = args.index("-i")
     assert args[i + 1] == "in.mp4" and args[i + 2: i + 8] == ["-ss", "0", "-t", "2", "-i", "pip.mp4"]
     assert "amix" not in args[args.index("-filter_complex") + 1]
+
+
+def test_combined_clips_use_their_own_inputs_and_local_times():
+    from simple_montage.export import build_export
+    a = MediaInfo("a.mp4", 10.0, 25.0, "25/1", 1920, 1080, True)
+    b = MediaInfo("b.mp4", 4.0, 25.0, "25/1", 640, 480, False)
+    # one segment crossing the clip boundary (8-12) is split into 8-10 (a) and 0-2 (b)
+    inputs, graph = build_export([Segment(8, 12)], [a, b])
+    assert inputs == [["-i", "b.mp4"]]
+    assert "[0:v:0]trim=start=7.98,setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease" in graph
+    assert "[1:v:0]trim=end=1.98,setpts=PTS-STARTPTS,scale=1920:1080" in graph and "pad=1920:1080" in graph
+    assert "anullsrc=r=48000:cl=stereo,atrim=duration=2[a1]" in graph     # b has no sound
+    assert "concat=n=2:v=1:a=1" in graph
+
+
+def test_same_size_clips_are_not_rescaled():
+    a = MediaInfo("a.mp4", 10.0, 25.0, "25/1", 1920, 1080, True)
+    b = MediaInfo("b.mp4", 4.0, 25.0, "25/1", 1920, 1080, True)
+    assert "pad=" not in build_filter_graph([Segment(0, 14)], [a, b])

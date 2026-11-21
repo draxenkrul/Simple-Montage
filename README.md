@@ -4,6 +4,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 
 ![Simple Montage](docs/screenshot.png)
 
+- Combine several videos on one timeline, reorder or remove them
 - Split the video at the playhead, delete parts, or cut/keep an In→Out range
 - Give every segment its own speed (0.1× – 10×), audio keeps its pitch
 - Zoom into the picture per segment (1× – 5×) and choose which part is shown
@@ -132,8 +133,23 @@ Click a block to select it, then delete it or change its speed.
 | Ctrl+O / Ctrl+E | Open / export |
 | Ctrl+Shift+E | Export selected segment |
 | Right-click timeline | Export menu (segment, all segments, cut-out part) |
+| Ctrl+Shift+A | Add video to the end (combine) |
 | Ctrl+Shift+O | Add overlay video |
 | Mouse wheel on timeline | Zoom (Shift+wheel scrolls) |
+
+## Combining videos
+
+- **➕ Add video** (or **File → Add video to the end…**, Ctrl+Shift+A) appends one or more
+  videos after what is already on the timeline. You can also drag files onto the window and
+  choose *Add to the end of the timeline*.
+- Clips are shown with their number and name; dashed white lines mark where one ends and the
+  next begins.
+- **Right-click** a clip on the timeline → *Move clip earlier / later* or *Remove clip from the
+  timeline*. Its cuts, speed, zoom, lighting and overlays move with it. Undo works for all of it.
+- Everything else works across clips: split, cut, speed, zoom, light, overlays, range export
+  and the ⬇ segment buttons.
+- The **first clip sets the output size and frame rate**. Clips with a different shape are fitted
+  in with black bars; clips without sound are silent in the result.
 
 ## Zooming
 

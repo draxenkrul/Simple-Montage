@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
         self.selected_overlay = -1
         self.muted = False
         self.playback_rate = 1.0
+        self._seek_after_load = 0.0
         self._skip_target: float | None = None
         self._skip_started = 0.0
         self._export: ExportRunner | None = None
@@ -92,6 +93,7 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         m_file = self.menuBar().addMenu("&File")
         self.act_open = self._action("&Open video…", QKeySequence.StandardKey.Open, self.open_dialog, m_file)
+        self.act_add_clip = self._action("Add &video to the end…", "Ctrl+Shift+A", self.add_clip_dialog, m_file)
         self.act_add_overlay = self._action("Add &overlay video…", "Ctrl+Shift+O", self.add_overlay_dialog, m_file)
         self.act_export = self._action("&Export…", "Ctrl+E", self.export_dialog, m_file)
         self.act_export_segment = self._action("Export selected &segment…", "Ctrl+Shift+E",
@@ -187,6 +189,8 @@ class MainWindow(QMainWindow):
         self.btn_out = self._button("Out (O) ]", "Set Out mark at the playhead", self.set_out)
         self.btn_cut_range = self._button("Cut In→Out (X)", "Remove everything between the marks", self.cut_range)
         self.btn_keep_range = self._button("Keep In→Out (K)", "Remove everything outside the marks", self.keep_range)
+        self.btn_add_clip = self._button("➕ Add video", "Add another video to the end of the timeline (Ctrl+Shift+A)",
+                                         self.add_clip_dialog)
         self.btn_export_segment = self._button("⬇ Export segment", "Export the selected segment to a file (Ctrl+Shift+E)",
                                                lambda: self.export_segment())
 
@@ -221,7 +225,7 @@ class MainWindow(QMainWindow):
 
         edit_row = QHBoxLayout()
         for w in (self.btn_split, self.btn_delete, self.btn_in, self.btn_out,
-                  self.btn_cut_range, self.btn_keep_range, self.btn_export_segment):
+                  self.btn_cut_range, self.btn_keep_range, self.btn_add_clip, self.btn_export_segment):
             edit_row.addWidget(w)
         edit_row.addStretch()
         edit_row.addWidget(self.segment_label)
@@ -272,13 +276,16 @@ class MainWindow(QMainWindow):
     def _connect(self) -> None:
         self.player.position_changed.connect(self._on_position)
         self.player.pause_changed.connect(self._on_pause_changed)
-        self.player.file_loaded.connect(lambda: self.seek(0))
+        self.player.file_loaded.connect(lambda: self.seek(self._seek_after_load))
         self.timeline_view.seek_requested.connect(self.seek)
         self.timeline_view.segment_clicked.connect(self.select)
         self.timeline_view.overlay_clicked.connect(self.select_overlay)
         self.timeline_view.export_segment_requested.connect(self.export_segment)
         self.timeline_view.export_all_requested.connect(self.export_all_segments)
         self.timeline_view.export_cut_requested.connect(self.export_cut_part)
+        self.timeline_view.add_clip_requested.connect(self.add_clip_dialog)
+        self.timeline_view.move_clip_requested.connect(self.move_clip)
+        self.timeline_view.remove_clip_requested.connect(self.remove_clip)
         self.timeline_view.overlay_moved.connect(lambda i, t: self.change_overlay({"start": t}))
         self.light_panel.light_changed.connect(self.set_segment_light)
         self.light_panel.reset_requested.connect(self.reset_segment_light)
@@ -310,20 +317,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Cannot open video", str(exc))
             return
         self.info = info
-        self.timeline.reset(info.duration, info.fps)
+        self.timeline.reset(info.duration, info.fps, [info])
         self.position = 0.0
         self.mark_in = self.mark_out = None
         self.selected = -1
         self.selected_overlay = -1
         self.overlay_preview.hide()
         self.timeline_view.reset_view()
-        aspect = info.width * float(Fraction(info.sar)) / info.height if info.height else 16 / 9
-        self.aspect = aspect
-        self.video_frame.set_aspect(aspect)
-        self.navigator.set_aspect(aspect)
+        self._apply_first_clip()
         self.player.set_view(1.0, 0.5, 0.5)
+        self._seek_after_load = 0.0
         self.player.load(path)
-        self.setWindowTitle(f"{Path(path).name} — Simple Montage")
+        self._update_title()
         fps = f"{info.fps:.3f}".rstrip("0").rstrip(".")
         self.statusBar().showMessage(
             f"{info.width}×{info.height} · {fps} fps · {format_time(info.duration)}"
@@ -337,8 +342,97 @@ class MainWindow(QMainWindow):
 
     def dropEvent(self, event) -> None:  # noqa: N802
         urls = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
-        if urls:
+        if not urls:
+            return
+        if not self.info:
             self.open_file(urls[0])
+            urls = urls[1:]
+        elif len(urls) == 1:
+            box = QMessageBox(QMessageBox.Icon.Question, "Video dropped",
+                              f"What should happen with {Path(urls[0]).name}?", parent=self)
+            add = box.addButton("Add to the end of the timeline", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("Open it instead (start over)", QMessageBox.ButtonRole.DestructiveRole)
+            cancel = box.addButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if box.clickedButton() is cancel:
+                return
+            if box.clickedButton() is not add:
+                self.open_file(urls[0])
+                return
+        for path in urls:  # several files: add them all in order
+            self.add_clip(path)
+
+    # ========================================================== combining clips
+    @property
+    def any_audio(self) -> bool:
+        return any(src.has_audio for src in self.timeline.sources)
+
+    def add_clip_dialog(self) -> None:
+        if not self.info:
+            self.open_dialog()
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Add videos to the end", "", VIDEO_FILTER)
+        for path in paths:
+            self.add_clip(path)
+
+    def add_clip(self, path: str) -> None:
+        """Append another video to the end of the timeline."""
+        try:
+            info = probe(find_ffprobe() or "ffprobe", path)
+        except (ProbeError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Cannot add video", f"{Path(path).name}:\n{exc}")
+            return
+        k = self.timeline.append_clip(info)
+        self._reload_clips(self.timeline.clip_offsets[k])
+        index = self.timeline.index_at(self.timeline.clip_offsets[k] + 1e-6)
+        self.selected = -1 if index is None else index
+        self._refresh()
+
+    def move_clip(self, k: int, step: int) -> None:
+        if self.timeline.move_clip(k, step):
+            self.selected = self.selected_overlay = -1
+            self._reload_clips(self.timeline.clip_offsets[k + step])
+            self._refresh()
+
+    def remove_clip(self, k: int) -> None:
+        if self.timeline.remove_clip(k):
+            self.selected = self.selected_overlay = -1
+            self._reload_clips(min(self.position, self.timeline.duration))
+            self._refresh()
+
+    def _apply_first_clip(self) -> None:
+        """The first clip sets the output size, so the preview takes its shape."""
+        info = self.info = self.timeline.sources[0]
+        aspect = info.width * float(Fraction(info.sar)) / info.height if info.height else 16 / 9
+        self.aspect = aspect
+        self.video_frame.set_aspect(aspect)
+        self.navigator.set_aspect(aspect)
+
+    def _clip_list(self) -> list[tuple[str, float]]:
+        return [(src.path, src.duration) for src in self.timeline.sources]
+
+    def _reload_clips(self, seek_to: float) -> None:
+        """Reload the preview after the list of clips changed."""
+        self.player.pause()
+        self._seek_after_load = min(max(seek_to, 0.0), self.timeline.duration)
+        self.position = self._seek_after_load
+        self.timeline_view.reset_view()
+        self._apply_first_clip()
+        self.player.load_clips(self._clip_list())
+        self._update_title()
+        if len(self.timeline.sources) > 1:
+            first = self.timeline.sources[0]
+            self.statusBar().showMessage(
+                f"{len(self.timeline.sources)} clips · {format_time(self.timeline.duration)} in total · "
+                f"output {first.width}×{first.height} (set by the first clip)")
+
+    def _update_title(self) -> None:
+        if not self.timeline.sources:
+            self.setWindowTitle("Simple Montage")
+            return
+        first = Path(self.timeline.sources[0].path).name
+        more = len(self.timeline.sources) - 1
+        self.setWindowTitle(f"{first}{f' + {more} more' if more else ''} — Simple Montage")
 
     # ================================================================ export
     def export_dialog(self) -> None:
@@ -348,7 +442,7 @@ class MainWindow(QMainWindow):
         if not ffmpeg:
             return
         self.player.pause()
-        choice = ExportDialog(self.timeline, self.info.has_audio, self.mark_in, self.mark_out, self)
+        choice = ExportDialog(self.timeline, self.any_audio, self.mark_in, self.mark_out, self)
         if choice.exec() != ExportDialog.DialogCode.Accepted:
             return
         opts = choice.options()
@@ -369,7 +463,7 @@ class MainWindow(QMainWindow):
             out += "." + chosen_filter.split("*.")[-1].rstrip(")")
         if not self._export_target_ok(out, opts.mode):
             return
-        args = build_ffmpeg_args(ffmpeg, self.info, opts.segments, out, mode=opts.mode,
+        args = build_ffmpeg_args(ffmpeg, self.timeline.sources, opts.segments, out, mode=opts.mode,
                                  overlays=self.timeline.overlays)
         self._run_exports([(args, sum(seg.output_duration for seg in opts.segments), out)])
 
@@ -411,7 +505,7 @@ class MainWindow(QMainWindow):
         mode = ExportMode.AUDIO_ONLY if ext in AUDIO_FORMATS else ExportMode.VIDEO_AND_AUDIO
         if not self._export_target_ok(out, mode):
             return
-        args = build_ffmpeg_args(ffmpeg, self.info, segments, out, mode=mode, overlays=overlays)
+        args = build_ffmpeg_args(ffmpeg, self.timeline.sources, segments, out, mode=mode, overlays=overlays)
         self._run_exports([(args, sum(s.output_duration for s in segments), out)])
 
     def export_all_segments(self) -> None:
@@ -423,7 +517,7 @@ class MainWindow(QMainWindow):
             return
         self.player.pause()
         kinds = ["Video (MP4)", "Sound only (MP3)", "Sound only (WAV)"]
-        if not self.info.has_audio:
+        if not self.any_audio:
             kinds = kinds[:1]
         kind, ok = QInputDialog.getItem(
             self, "Export all segments",
@@ -446,7 +540,7 @@ class MainWindow(QMainWindow):
             return
         jobs = []
         for seg, out in zip(self.timeline.segments, outs):
-            args = build_ffmpeg_args(ffmpeg, self.info, [seg], out, mode=mode, overlays=self.timeline.overlays)
+            args = build_ffmpeg_args(ffmpeg, self.timeline.sources, [seg], out, mode=mode, overlays=self.timeline.overlays)
             jobs.append((args, seg.output_duration, out))
         self._run_exports(jobs, folder=folder)
 
@@ -457,10 +551,10 @@ class MainWindow(QMainWindow):
         return ffmpeg
 
     def _export_target_ok(self, out: str, mode: ExportMode) -> bool:
-        if os.path.abspath(out) == os.path.abspath(self.info.path):
+        if any(os.path.abspath(out) == os.path.abspath(src.path) for src in self.timeline.sources):
             QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
             return False
-        if mode == ExportMode.AUDIO_ONLY and not self.info.has_audio:
+        if mode == ExportMode.AUDIO_ONLY and not self.any_audio:
             QMessageBox.warning(self, "Export", "This video has no sound to export.")
             return False
         return True
@@ -792,14 +886,17 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def undo(self) -> None:
-        if self.timeline.undo():
-            self.selected = self.selected_overlay = -1
-            self._update_player_view()
-            self._refresh()
+        self._undo_redo(self.timeline.undo)
 
     def redo(self) -> None:
-        if self.timeline.redo():
+        self._undo_redo(self.timeline.redo)
+
+    def _undo_redo(self, action) -> None:
+        clips_before = self._clip_list()
+        if action():
             self.selected = self.selected_overlay = -1
+            if self._clip_list() != clips_before:  # a clip was added, moved or removed
+                self._reload_clips(min(self.position, self.timeline.duration))
             self._update_player_view()
             self._refresh()
 

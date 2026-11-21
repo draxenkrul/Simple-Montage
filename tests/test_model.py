@@ -208,3 +208,51 @@ def test_gap_at_and_has_cuts():
     assert tl.gap_at(3.0) == (2.0, 4.0)
     assert tl.gap_at(9.0) == (8.0, 10.0)
     assert tl.gap_at(1.0) is None and tl.gap_at(10.0) is None
+
+
+def _media(path, duration, w=320, h=240, audio=True):
+    from simple_montage.probe import MediaInfo
+    return MediaInfo(path, duration, 25.0, "25/1", w, h, audio)
+
+
+def test_append_clip_extends_the_timeline():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    tl.split(4)
+    k = tl.append_clip(_media("b.mp4", 5))
+    assert k == 1 and tl.duration == 15 and tl.clip_offsets == [0, 10]
+    assert spans(tl)[-1] == (10.0, 15.0, 1.0)
+    assert tl.clip_at(12) == 1 and tl.clip_at(3) == 0
+    tl.undo()
+    assert tl.duration == 10 and len(tl.sources) == 1
+
+
+def test_move_clip_takes_edits_and_overlays_along():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    tl.append_clip(_media("b.mp4", 4))
+    tl.split(12)                      # inside clip b: 10-12, 12-14
+    tl.set_speed(2, 2.0)
+    tl.add_overlay(_overlay(start=11.0, length=1.0))
+    assert tl.move_clip(1, -1)        # b first
+    assert [s.path for s in tl.sources] == ["b.mp4", "a.mp4"]
+    assert spans(tl) == [(0.0, 2.0, 1.0), (2.0, 4.0, 2.0), (4.0, 14.0, 1.0)]
+    assert tl.overlays[0].start == pytest.approx(1.0)
+    tl.undo()
+    assert [s.path for s in tl.sources] == ["a.mp4", "b.mp4"] and tl.overlays[0].start == 11.0
+
+
+def test_remove_clip_closes_the_gap():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    tl.append_clip(_media("b.mp4", 4))
+    tl.append_clip(_media("c.mp4", 6))
+    tl.add_overlay(_overlay(start=11.0, length=1.0))   # on b: removed with it
+    tl.add_overlay(_overlay(start=15.0, length=1.0))   # on c: moves up
+    assert tl.remove_clip(1)
+    assert tl.duration == 16 and [s.path for s in tl.sources] == ["a.mp4", "c.mp4"]
+    assert spans(tl) == [(0.0, 10.0, 1.0), (10.0, 16.0, 1.0)]
+    assert [ov.start for ov in tl.overlays] == [pytest.approx(11.0)]
+    assert not tl.remove_clip(5)
+
+
+def test_cannot_remove_the_only_clip():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    assert not tl.remove_clip(0)

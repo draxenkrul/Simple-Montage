@@ -72,7 +72,21 @@ class MpvPlayer(QWidget):
     def load(self, path: str) -> None:
         self._mpv.pause = True
         self._mpv.speed = 1.0
+        self._light_filter = ""
         self._mpv.loadfile(path)
+
+    def load_clips(self, clips: list[tuple[str, float]]) -> None:
+        """Play several files back to back as one timeline.
+
+        ``clips`` are ``(path, duration)`` pairs. Uses mpv's EDL playlist so
+        seeking and playback run seamlessly across clips; the durations are
+        given explicitly so mpv's timeline matches ours exactly.
+        """
+        if len(clips) == 1:
+            self.load(clips[0][0])
+            return
+        parts = [f"%{len(path.encode('utf-8'))}%{path},0,{duration:.6f}" for path, duration in clips]
+        self.load("edl://" + ";".join(parts))
 
     @property
     def paused(self) -> bool:

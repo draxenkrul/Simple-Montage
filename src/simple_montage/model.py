@@ -6,6 +6,10 @@ cut out of the final video. Every segment has its own speed, zoom and
 lighting. :class:`Overlay` clips are other videos shown on top of the main
 one, placed on the same source-time axis.
 
+Several videos can be combined: their files (``sources``) are laid end to
+end, so the "source time" axis runs through clip 1, then clip 2, and so on.
+A segment never crosses from one clip into the next.
+
 This module has no Qt or FFmpeg dependency so it can be unit-tested directly.
 """
 
@@ -14,6 +18,8 @@ from __future__ import annotations
 import copy
 from bisect import bisect_right
 from dataclasses import dataclass, replace
+
+from simple_montage.probe import MediaInfo
 
 MIN_SPEED = 0.1
 MAX_SPEED = 10.0
@@ -124,17 +130,102 @@ class Timeline:
         self.reset(duration, fps)
 
     # ------------------------------------------------------------------ setup
-    def reset(self, duration: float, fps: float) -> None:
+    def reset(self, duration: float, fps: float, sources: list[MediaInfo] | None = None) -> None:
         """Start over with the whole source kept as a single segment."""
+        self.sources: list[MediaInfo] = list(sources or [])
         self.duration = max(0.0, float(duration))
         self.fps = float(fps) if fps and fps > 0 else 30.0
         self.segments: list[Segment] = (
             [Segment(0.0, self.duration)] if self.duration > 0 else []
         )
         self.overlays: list[Overlay] = []
-        self._undo: list[tuple[list[Segment], list[Overlay]]] = []
-        self._redo: list[tuple[list[Segment], list[Overlay]]] = []
+        self._undo: list[tuple] = []
+        self._redo: list[tuple] = []
         self._last_op: object = None
+
+    @classmethod
+    def from_media(cls, info: MediaInfo) -> Timeline:
+        tl = cls()
+        tl.reset(info.duration, info.fps, [info])
+        return tl
+
+    # ------------------------------------------------------- combined clips
+    @property
+    def clip_offsets(self) -> list[float]:
+        """Where each source clip starts on the timeline."""
+        offsets, t = [], 0.0
+        for src in self.sources:
+            offsets.append(t)
+            t += src.duration
+        return offsets
+
+    def clip_at(self, t: float) -> int | None:
+        """Index of the source clip at timeline time ``t``."""
+        for k, (offset, src) in enumerate(zip(self.clip_offsets, self.sources)):
+            if offset <= t < offset + src.duration:
+                return k
+        return len(self.sources) - 1 if self.sources and t >= self.duration else None
+
+    def append_clip(self, info: MediaInfo) -> int:
+        """Add a video to the end of the timeline. Returns its clip index."""
+        self._checkpoint()
+        start = self.duration
+        self.sources.append(info)
+        self.duration += info.duration
+        self.segments.append(Segment(start, start + info.duration))
+        return len(self.sources) - 1
+
+    def remove_clip(self, k: int) -> bool:
+        """Take a video off the timeline; later clips move up to close the gap."""
+        if not 0 <= k < len(self.sources) or len(self.sources) < 2:
+            return False
+        self._checkpoint()
+        a = self.clip_offsets[k]
+        b = a + self.sources[k].duration
+        d = b - a
+        self.segments = [self._shifted(seg, -d if seg.start >= b else 0.0)
+                         for seg in self.segments if not (seg.start >= a and seg.end <= b + 1e-9)]
+        self.overlays = [replace(ov, start=ov.start - d if ov.start >= b else ov.start)
+                         for ov in self.overlays if not a <= ov.start < b]
+        del self.sources[k]
+        self.duration -= d
+        for ov in self.overlays:
+            self._clamp_overlay(ov)
+        return True
+
+    def move_clip(self, k: int, step: int) -> bool:
+        """Move clip ``k`` earlier (step -1) or later (+1), with its edits and overlays."""
+        j = k + step
+        if not (0 <= k < len(self.sources) and 0 <= j < len(self.sources)):
+            return False
+        self._checkpoint()
+        old_offsets = self.clip_offsets
+        order = list(range(len(self.sources)))
+        order[k], order[j] = order[j], order[k]
+        new_sources = [self.sources[i] for i in order]
+        new_offset_of, t = {}, 0.0
+        for i in order:
+            new_offset_of[i] = t
+            t += self.sources[i].duration
+        shift = {i: new_offset_of[i] - old_offsets[i] for i in range(len(self.sources))}
+
+        def clip_of(t: float) -> int:
+            for i in range(len(self.sources) - 1, -1, -1):
+                if t >= old_offsets[i] - 1e-9:
+                    return i
+            return 0
+
+        self.segments = sorted((self._shifted(seg, shift[clip_of(seg.start)]) for seg in self.segments),
+                               key=lambda seg: seg.start)
+        self.overlays = [replace(ov, start=ov.start + shift[clip_of(ov.start)]) for ov in self.overlays]
+        self.sources = new_sources
+        for ov in self.overlays:
+            self._clamp_overlay(ov)
+        return True
+
+    @staticmethod
+    def _shifted(seg: Segment, d: float) -> Segment:
+        return replace(seg, start=seg.start + d, end=seg.end + d)
 
     # -------------------------------------------------------------- utilities
     @property
@@ -402,8 +493,8 @@ class Timeline:
         self._redo.clear()
         self._last_op = op
 
-    def _snapshot(self) -> tuple[list[Segment], list[Overlay]]:
-        return copy.deepcopy((self.segments, self.overlays))
+    def _snapshot(self) -> tuple:
+        return copy.deepcopy((self.segments, self.overlays, self.sources, self.duration))
 
     @property
     def can_undo(self) -> bool:
@@ -417,7 +508,7 @@ class Timeline:
         if not self._undo:
             return False
         self._redo.append(self._snapshot())
-        self.segments, self.overlays = self._undo.pop()
+        self.segments, self.overlays, self.sources, self.duration = self._undo.pop()
         self._last_op = None
         return True
 
@@ -425,6 +516,6 @@ class Timeline:
         if not self._redo:
             return False
         self._undo.append(self._snapshot())
-        self.segments, self.overlays = self._redo.pop()
+        self.segments, self.overlays, self.sources, self.duration = self._redo.pop()
         self._last_op = None
         return True

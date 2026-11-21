@@ -205,3 +205,30 @@ def test_lighting_changes_only_its_segment(tmp_path):
     before, after = _pixel(out, 0.5, 60, 50), _pixel(out, 1.5, 60, 50)
     assert abs(before[0] - 128) < 15          # untouched
     assert after[0] > before[0] + 50          # brighter
+
+
+def test_combine_clips_of_different_size_and_sound(tmp_path):
+    from simple_montage.export import ExportMode
+    red = _solid_clip(tmp_path / "red.mp4", "red", "320x240", 3)
+    blue = tmp_path / "blue_silent.mp4"          # wide and without sound
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", "color=blue:s=320x120:r=30:d=2",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", str(blue)], check=True)
+    sources = [probe(FFPROBE, red), probe(FFPROBE, str(blue))]
+    tl = Timeline.from_media(sources[0])
+    tl.append_clip(sources[1])
+    tl.delete_range(1.0, 2.0)                   # cut 1 s out of the red clip
+    tl.split(3.5)
+    tl.set_speed(tl.index_at(4.0), 2.0)         # second half of blue at 2x
+    out = tmp_path / "combined.mp4"
+    args = build_ffmpeg_args(FFMPEG, tl.sources, tl.segments, str(out), mode=ExportMode.VIDEO_AND_AUDIO,
+                             preset="ultrafast")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+
+    exported = probe(FFPROBE, str(out))
+    assert (exported.width, exported.height) == (320, 240)
+    assert exported.duration == pytest.approx(2 + 0.5 + 0.75, abs=0.12)   # red 2 s, blue 0.5 + 1.5/2
+    assert exported.has_audio
+    assert _is("red", _pixel(out, 1.0, 150, 110))
+    assert _is("blue", _pixel(out, 2.3, 150, 110))       # blue, letterboxed
+    assert sum(_pixel(out, 2.3, 150, 10)) < 60            # black bar above it
