@@ -48,3 +48,48 @@ def test_cut_and_speed_change(source, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert int(frames) == expected * 25
+
+
+def _export(info, segments, out, mode):
+    from simple_montage.export import build_ffmpeg_args
+    args = build_ffmpeg_args(FFMPEG, info, segments, str(out), mode=mode, preset="ultrafast")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-2000:]
+
+
+def _streams(path):
+    out = subprocess.run([FFPROBE, "-v", "error", "-show_entries", "stream=codec_type",
+                          "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
+    return sorted(out.split())
+
+
+def test_export_part_of_timeline(source, tmp_path):
+    from simple_montage.export import ExportMode
+    info = probe(FFPROBE, source)
+    tl = Timeline(info.duration, info.fps)
+    out = tmp_path / "part.mp4"
+    _export(info, tl.segments_between(2.0, 5.0), out, ExportMode.VIDEO_AND_AUDIO)
+    assert probe(FFPROBE, str(out)).duration == pytest.approx(3.0, abs=0.1)
+    assert _streams(out) == ["audio", "video"]
+
+
+@pytest.mark.parametrize("ext", [".mp3", ".wav", ".m4a"])
+def test_export_sound_only(source, tmp_path, ext):
+    from simple_montage.export import ExportMode
+    info = probe(FFPROBE, source)
+    tl = Timeline(info.duration, info.fps)
+    out = tmp_path / ("sound" + ext)
+    _export(info, tl.segments_between(1.0, 4.0), out, ExportMode.AUDIO_ONLY)
+    assert _streams(out) == ["audio"]
+    dur = float(subprocess.run([FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                                "-of", "csv=p=0", str(out)], capture_output=True, text=True).stdout)
+    assert dur == pytest.approx(3.0, abs=0.1)
+
+
+def test_export_video_without_sound(source, tmp_path):
+    from simple_montage.export import ExportMode
+    info = probe(FFPROBE, source)
+    tl = Timeline(info.duration, info.fps)
+    out = tmp_path / "silent.mp4"
+    _export(info, tl.segments, out, ExportMode.VIDEO_ONLY)
+    assert _streams(out) == ["video"]

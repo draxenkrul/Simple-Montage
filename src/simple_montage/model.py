@@ -106,6 +106,21 @@ class Timeline:
                 break
         return out
 
+    def segments_between(self, a: float, b: float) -> list[Segment]:
+        """Copies of the kept segments clipped to timeline range ``[a, b)``.
+
+        Used to export only part of the timeline; the edit itself is unchanged.
+        Cut-out parts inside the range stay cut out, speeds are kept.
+        """
+        a, b = sorted((self.snap(a), self.snap(b)))
+        min_len = self.frame_duration * 0.5
+        result: list[Segment] = []
+        for seg in self.segments:
+            start, end = max(seg.start, a), min(seg.end, b)
+            if end - start >= min_len:
+                result.append(Segment(start, end, seg.speed))
+        return result
+
     # ---------------------------------------------------------------- editing
     def split(self, t: float) -> bool:
         """Split the segment under ``t`` into two. Returns True if it split."""

@@ -34,16 +34,20 @@ def _dark_palette() -> QPalette:
     return pal
 
 
-def smoke_test(report_path: str) -> int:
-    """Check that a (packaged) install is complete, without opening a window.
+def diagnostics() -> tuple[bool, list[str]]:
+    """Check that everything the app needs is installed. Returns (ok, report lines)."""
+    import platform
 
-    Used by the build to verify the .exe: finds FFmpeg/ffprobe, loads libmpv
-    and imports every module. Writes a report and returns 0 on success.
-    """
-    lines = [f"Simple Montage {__version__}"]
+    import PySide6
+
+    lines = [
+        f"Simple Montage {__version__}",
+        f"Python {platform.python_version()} ({platform.architecture()[0]}) at {sys.executable}",
+        f"PySide6 {PySide6.__version__}",
+    ]
     ok = True
     for name, path in (("ffmpeg", find_ffmpeg()), ("ffprobe", find_ffprobe())):
-        lines.append(f"{name}: {path or 'NOT FOUND'}")
+        lines.append(f"{name}: {path or 'NOT FOUND - put ' + name + '.exe into the bin folder'}")
         ok = ok and path is not None
     try:
         locale.setlocale(locale.LC_NUMERIC, "C")
@@ -55,14 +59,24 @@ def smoke_test(report_path: str) -> int:
         player.terminate()
     except Exception as exc:  # report anything, this is a diagnostic
         ok = False
-        lines.append(f"libmpv/modules: FAILED {exc!r}")
-    lines.append("RESULT: " + ("OK" if ok else "FAILED"))
+        lines.append(f"libmpv: NOT LOADED - put libmpv-2.dll into the bin folder ({exc})")
+    lines.append("RESULT: " + ("OK - everything is in place" if ok else "PROBLEM - see above"))
+    return ok, lines
+
+
+def smoke_test(report_path: str) -> int:
+    """Write the diagnostics to a file (used to verify a packaged .exe)."""
+    ok, lines = diagnostics()
     Path(report_path).write_text("\n".join(lines) + "\n", encoding="utf-8")
     return 0 if ok else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
+    if len(argv) > 1 and argv[1] == "--check":
+        ok, lines = diagnostics()
+        print("\n".join(lines))
+        return 0 if ok else 1
     if len(argv) > 1 and argv[1] == "--smoke-test":
         return smoke_test(argv[2] if len(argv) > 2 else "smoke-test.txt")
 

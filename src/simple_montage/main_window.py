@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from simple_montage.export import build_ffmpeg_args
+from simple_montage.export import AUDIO_FORMATS, ExportMode, build_ffmpeg_args
+from simple_montage.export_dialog import ExportDialog
 from simple_montage.export_runner import ExportRunner
 from simple_montage.model import MAX_SPEED, MIN_SPEED, Timeline
 from simple_montage.player import MpvPlayer
@@ -249,16 +250,31 @@ class MainWindow(QMainWindow):
         if not ffmpeg:
             QMessageBox.critical(self, "FFmpeg not found", "Put ffmpeg.exe into the 'bin' folder next to the app.")
             return
+        self.player.pause()
+        choice = ExportDialog(self.timeline, self.info.has_audio, self.mark_in, self.mark_out, self)
+        if choice.exec() != ExportDialog.DialogCode.Accepted:
+            return
+        opts = choice.options()
+
         src = Path(self.info.path)
-        suggested = str(src.with_name(f"{src.stem}_edit.mp4"))
-        out, _ = QFileDialog.getSaveFileName(self, "Export video", suggested, "MP4 video (*.mp4)")
+        if opts.mode == ExportMode.AUDIO_ONLY:
+            suggested = str(src.with_name(f"{src.stem}_sound.mp3"))
+            filters = "MP3 audio (*.mp3);;WAV audio (*.wav);;M4A audio (*.m4a)"
+            allowed = tuple(AUDIO_FORMATS)
+        else:
+            suggested = str(src.with_name(f"{src.stem}_edit.mp4"))
+            filters = "MP4 video (*.mp4)"
+            allowed = (".mp4",)
+        out, chosen_filter = QFileDialog.getSaveFileName(self, "Export", suggested, filters)
         if not out:
             return
+        if Path(out).suffix.lower() not in allowed:  # add the extension of the chosen type
+            out += "." + chosen_filter.split("*.")[-1].rstrip(")")
         if os.path.abspath(out) == os.path.abspath(self.info.path):
             QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
             return
-        self.player.pause()
-        args = build_ffmpeg_args(ffmpeg, self.info, self.timeline.segments, out)
+        args = build_ffmpeg_args(ffmpeg, self.info, opts.segments, out, mode=opts.mode)
+        output_duration = sum(seg.output_duration for seg in opts.segments)
 
         dialog = QProgressDialog("Exporting…", "Cancel", 0, 1000, self)
         dialog.setWindowTitle("Export")
@@ -267,7 +283,7 @@ class MainWindow(QMainWindow):
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
 
-        runner = ExportRunner(args, self.timeline.output_duration, self)
+        runner = ExportRunner(args, output_duration, self)
         runner.progress.connect(lambda f: dialog.setValue(int(f * 1000)))
         dialog.canceled.connect(runner.cancel)
 

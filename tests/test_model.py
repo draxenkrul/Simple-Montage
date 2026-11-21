@@ -93,3 +93,20 @@ def test_cut_points():
 def test_segment_contains_is_half_open():
     seg = Segment(1.0, 2.0)
     assert seg.contains(1.0) and not seg.contains(2.0)
+
+
+def test_segments_between_clips_without_changing_the_edit():
+    tl = Timeline(20.0, 25)
+    tl.delete_range(7, 8)      # kept: 0-7, 8-20
+    tl.split(12)
+    tl.set_speed(2, 2.0)       # 12-20 at 2x
+    part = tl.segments_between(5, 14)
+    assert [(s.start, s.end, s.speed) for s in part] == [(5.0, 7.0, 1.0), (8.0, 12.0, 1.0), (12.0, 14.0, 2.0)]
+    assert sum(s.output_duration for s in part) == pytest.approx(7.0)
+    assert spans(tl) == [(0.0, 7.0, 1.0), (8.0, 12.0, 1.0), (12.0, 20.0, 2.0)]  # untouched
+
+
+def test_segments_between_cut_out_range_is_empty():
+    tl = Timeline(20.0, 25)
+    tl.delete_range(5, 10)
+    assert tl.segments_between(6, 9) == []

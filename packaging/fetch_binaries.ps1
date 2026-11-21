@@ -2,6 +2,8 @@
 # Files that are already there are kept.
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"   # makes Invoke-WebRequest much faster
+# Windows PowerShell 5.1 on older Windows 10 may not enable TLS 1.2 by default
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
 $bin = Join-Path (Split-Path -Parent $PSScriptRoot) "bin"
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "simple-montage-download"
