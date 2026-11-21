@@ -7,7 +7,6 @@ venv/
 .pytest_cache/
 build/
 dist/
-*.spec
 
 # External binaries (ffmpeg.exe, ffprobe.exe, libmpv-2.dll) are downloaded, not committed
 bin/*
