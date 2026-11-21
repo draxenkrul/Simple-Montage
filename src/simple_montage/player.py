@@ -91,5 +91,12 @@ class MpvPlayer(QWidget):
         if abs((self._mpv.speed or 1.0) - speed) > 1e-6:
             self._mpv.speed = speed
 
+    def set_volume(self, percent: int) -> None:
+        """Preview loudness, 0-100 (does not affect the export)."""
+        self._mpv.volume = max(0, min(100, int(percent)))
+
+    def set_muted(self, muted: bool) -> None:
+        self._mpv.mute = bool(muted)
+
     def shutdown(self) -> None:
         self._mpv.terminate()

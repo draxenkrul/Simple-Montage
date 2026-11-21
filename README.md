@@ -9,6 +9,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 - Frame-exact preview with frame stepping; playback can preview the edit (skips cuts, applies speeds)
 - Export the whole timeline or only part of it (e.g. second 5 to 10)
 - Export video with sound, video without sound, or **sound only** (MP3 / WAV / M4A)
+- Preview volume slider and mute (remembered between runs)
 - Undo / redo
 
 ---
@@ -115,6 +116,8 @@ Click a block to select it, then delete it or change its speed.
 | Shift + ← / → | Back / forward 1 second |
 | ↑ / ↓ | Previous / next cut point |
 | Home / End | Start / end |
+| + / − | Preview volume up / down |
+| M | Mute / unmute preview |
 | S | Split at playhead |
 | Del | Delete selected segment |
 | I / O | Set In / Out mark |

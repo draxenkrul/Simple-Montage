@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -36,6 +37,7 @@ from simple_montage.tools import find_ffmpeg, find_ffprobe
 VIDEO_FILTER = "Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mts *.m2ts *.wmv *.flv);;All files (*)"
 PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0]
 SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0]
+VOLUME_STEP = 5
 
 
 class MainWindow(QMainWindow):
@@ -62,6 +64,7 @@ class MainWindow(QMainWindow):
         self._build_actions()
         self._build_ui()
         self._connect()
+        self._restore_volume()
         self._refresh()
 
     # ================================================================ UI setup
@@ -106,6 +109,10 @@ class MainWindow(QMainWindow):
         self._action("Previous cut", "Up", self.previous_cut, m_play)
         self._action("Go to start", "Home", lambda: self.seek(0), m_play)
         self._action("Go to end", "End", lambda: self.seek(self.timeline.duration), m_play)
+        m_play.addSeparator()
+        self._action("Volume up", ["+", "="], lambda: self.change_volume(VOLUME_STEP), m_play)
+        self._action("Volume down", "-", lambda: self.change_volume(-VOLUME_STEP), m_play)
+        self._action("Mute / unmute", "M", self.toggle_mute, m_play)
 
     def _button(self, text: str, tooltip: str, slot) -> QPushButton:
         btn = QPushButton(text)
@@ -134,11 +141,25 @@ class MainWindow(QMainWindow):
         self.preview_edits.setChecked(True)
         self.preview_edits.setToolTip("Skip cut-out parts and apply segment speeds while playing")
 
+        self.btn_mute = self._button("🔊", "Mute / unmute (M)", self.toggle_mute)
+        self.btn_mute.setFixedWidth(36)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setFixedWidth(120)
+        self.volume_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # arrows stay frame-stepping
+        self.volume_slider.setToolTip("Preview volume (+ / −). Does not change the exported sound.")
+        self.volume_label = QLabel()
+        self.volume_label.setMinimumWidth(36)
+
         transport = QHBoxLayout()
         for w in (self.btn_prev, self.btn_play, self.btn_next):
             transport.addWidget(w)
         transport.addWidget(self.time_label)
         transport.addStretch()
+        transport.addWidget(self.btn_mute)
+        transport.addWidget(self.volume_slider)
+        transport.addWidget(self.volume_label)
+        transport.addSpacing(12)
         transport.addWidget(QLabel("Playback:"))
         transport.addWidget(self.rate_combo)
         transport.addWidget(self.preview_edits)
@@ -199,6 +220,7 @@ class MainWindow(QMainWindow):
         self.timeline_view.segment_clicked.connect(self.select)
         self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
         self.preview_edits.toggled.connect(lambda _: self._update_player_speed())
+        self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.speed_spin.valueChanged.connect(self.set_segment_speed)
 
     # ================================================================== files
@@ -382,6 +404,36 @@ class MainWindow(QMainWindow):
             self.player.seek(self._skip_target)
         self.player.set_speed(self.playback_rate * self.timeline.segments[index].speed)
 
+    # ================================================================= volume
+    def _restore_volume(self) -> None:
+        settings = QSettings("SimpleMontage", "SimpleMontage")
+        volume = settings.value("volume", 80, type=int)
+        self.muted = False  # set the level first so restoring it does not unmute
+        self.volume_slider.setValue(volume)
+        self._on_volume_changed(self.volume_slider.value())  # apply even if unchanged
+        self.muted = settings.value("muted", False, type=bool)
+        self.player.set_muted(self.muted)
+        self._update_mute_button()
+
+    def _on_volume_changed(self, value: int) -> None:
+        self.player.set_volume(value)
+        self.volume_label.setText(f"{value}%")
+        if self.muted and value > 0:  # moving the slider unmutes, like most players
+            self.toggle_mute()
+        self._update_mute_button()
+
+    def change_volume(self, delta: int) -> None:
+        self.volume_slider.setValue(self.volume_slider.value() + delta)
+
+    def toggle_mute(self) -> None:
+        self.muted = not self.muted
+        self.player.set_muted(self.muted)
+        self._update_mute_button()
+
+    def _update_mute_button(self) -> None:
+        silent = self.muted or self.volume_slider.value() == 0
+        self.btn_mute.setText("🔇" if silent else "🔊")
+
     # ================================================================ editing
     def select(self, index: int) -> None:
         self.selected = index
@@ -511,5 +563,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._export is not None:
             self._export.cancel()
+        settings = QSettings("SimpleMontage", "SimpleMontage")
+        settings.setValue("volume", self.volume_slider.value())
+        settings.setValue("muted", self.muted)
         self.player.shutdown()
         super().closeEvent(event)
