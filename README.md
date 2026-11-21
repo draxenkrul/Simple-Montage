@@ -10,6 +10,25 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 - Undo / redo
 - Export to MP4 (H.264 + AAC) with FFmpeg
 
+## Get the app (Windows)
+
+**Download a ready build:** open the repository's **Actions** tab → **Build Windows app** →
+the latest successful run → download **SimpleMontage-windows-x64** under *Artifacts*.
+Extract the zip anywhere and double-click **`SimpleMontage.exe`**. Nothing else to install —
+FFmpeg and the video player library are inside the `bin` folder.
+
+Pushing a tag like `v0.1.0` also publishes the zip as a GitHub Release.
+
+**Build it yourself** (needs Python 3.12+), from the project folder in PowerShell:
+
+```bash
+powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1
+```
+
+It creates a virtual environment, downloads FFmpeg and libmpv, runs the tests, builds with
+PyInstaller and checks the result. Output: `dist\SimpleMontage\SimpleMontage.exe` and
+`dist\SimpleMontage-windows-x64.zip`.
+
 ## Tech stack
 
 | Part | Used for |
@@ -19,7 +38,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 | python-mpv + libmpv | video preview (exact seeking, frame stepping, variable speed) |
 | FFmpeg / ffprobe | reading video info and exporting |
 
-## Setup (Windows)
+## Development setup (Windows)
 
 1. Install **Python 3.12+** from python.org (tick "Add python.exe to PATH").
 2. In the project folder:
@@ -36,8 +55,9 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
    pip install -e .[dev]
    ```
 
-3. Download the external binaries into the `bin\` folder — see [`bin/README.md`](bin/README.md):
-   `ffmpeg.exe`, `ffprobe.exe`, `libmpv-2.dll`.
+3. Download the external binaries into the `bin\` folder — run
+   `powershell -ExecutionPolicy Bypass -File packaging\fetch_binaries.ps1`, or get them by hand
+   (see [`bin/README.md`](bin/README.md)): `ffmpeg.exe`, `ffprobe.exe`, `libmpv-2.dll`.
 4. Run:
 
    ```bash
@@ -85,6 +105,8 @@ src/simple_montage/
   probe.py            reads video info with ffprobe
   tools.py            finds ffmpeg / ffprobe / libmpv
 tests/                unit tests + an end-to-end FFmpeg export test
+packaging/            Windows build: PyInstaller spec, build & download scripts, icon
+.github/workflows/    builds the Windows app on every push
 ```
 
 ## Ideas for next steps
@@ -93,4 +115,4 @@ tests/                unit tests + an end-to-end FFmpeg export test
 - Reverse and freeze-frame segments
 - Smooth slow motion (frame interpolation)
 - Multiple source clips and reordering
-- Export presets (quality, resolution) and a packaged `.exe` (PyInstaller)
+- Export presets (quality, resolution)
