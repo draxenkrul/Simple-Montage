@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
+    QInputDialog,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -29,7 +30,7 @@ from PySide6.QtWidgets import (
 from simple_montage.export import AUDIO_FORMATS, ExportMode, build_ffmpeg_args
 from simple_montage.export_dialog import ExportDialog
 from simple_montage.export_runner import ExportRunner
-from simple_montage.model import MAX_SPEED, MAX_ZOOM, MIN_SPEED, MIN_ZOOM, Overlay, Timeline
+from simple_montage.model import MAX_SPEED, MAX_ZOOM, MIN_SPEED, MIN_ZOOM, Overlay, Segment, Timeline
 from simple_montage.panels import LightPanel, OverlayPanel
 from simple_montage.player import MpvPlayer, OverlayPreview, VideoFrame
 from simple_montage.probe import MediaInfo, ProbeError, probe
@@ -43,6 +44,7 @@ PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0]
 SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0]
 VOLUME_STEP = 5
 ZOOM_PRESETS = [1.0, 1.5, 2.0, 3.0]
+QUICK_EXPORT_FILTERS = "MP4 video (*.mp4);;MP3 sound (*.mp3);;WAV sound (*.wav);;M4A sound (*.m4a)"
 
 
 class MainWindow(QMainWindow):
@@ -92,6 +94,10 @@ class MainWindow(QMainWindow):
         self.act_open = self._action("&Open video…", QKeySequence.StandardKey.Open, self.open_dialog, m_file)
         self.act_add_overlay = self._action("Add &overlay video…", "Ctrl+Shift+O", self.add_overlay_dialog, m_file)
         self.act_export = self._action("&Export…", "Ctrl+E", self.export_dialog, m_file)
+        self.act_export_segment = self._action("Export selected &segment…", "Ctrl+Shift+E",
+                                               lambda: self.export_segment(), m_file)
+        self.act_export_all = self._action("Export &all segments separately…", None,
+                                           self.export_all_segments, m_file)
         m_file.addSeparator()
         self._action("&Quit", QKeySequence.StandardKey.Quit, self.close, m_file)
 
@@ -181,6 +187,8 @@ class MainWindow(QMainWindow):
         self.btn_out = self._button("Out (O) ]", "Set Out mark at the playhead", self.set_out)
         self.btn_cut_range = self._button("Cut In→Out (X)", "Remove everything between the marks", self.cut_range)
         self.btn_keep_range = self._button("Keep In→Out (K)", "Remove everything outside the marks", self.keep_range)
+        self.btn_export_segment = self._button("⬇ Export segment", "Export the selected segment to a file (Ctrl+Shift+E)",
+                                               lambda: self.export_segment())
 
         self.segment_label = QLabel()
         self.speed_spin = QDoubleSpinBox()
@@ -213,7 +221,7 @@ class MainWindow(QMainWindow):
 
         edit_row = QHBoxLayout()
         for w in (self.btn_split, self.btn_delete, self.btn_in, self.btn_out,
-                  self.btn_cut_range, self.btn_keep_range):
+                  self.btn_cut_range, self.btn_keep_range, self.btn_export_segment):
             edit_row.addWidget(w)
         edit_row.addStretch()
         edit_row.addWidget(self.segment_label)
@@ -268,6 +276,9 @@ class MainWindow(QMainWindow):
         self.timeline_view.seek_requested.connect(self.seek)
         self.timeline_view.segment_clicked.connect(self.select)
         self.timeline_view.overlay_clicked.connect(self.select_overlay)
+        self.timeline_view.export_segment_requested.connect(self.export_segment)
+        self.timeline_view.export_all_requested.connect(self.export_all_segments)
+        self.timeline_view.export_cut_requested.connect(self.export_cut_part)
         self.timeline_view.overlay_moved.connect(lambda i, t: self.change_overlay({"start": t}))
         self.light_panel.light_changed.connect(self.set_segment_light)
         self.light_panel.reset_requested.connect(self.reset_segment_light)
@@ -333,9 +344,8 @@ class MainWindow(QMainWindow):
     def export_dialog(self) -> None:
         if not self.info or not self.timeline.segments:
             return
-        ffmpeg = find_ffmpeg()
+        ffmpeg = self._require_ffmpeg()
         if not ffmpeg:
-            QMessageBox.critical(self, "FFmpeg not found", "Put ffmpeg.exe into the 'bin' folder next to the app.")
             return
         self.player.pause()
         choice = ExportDialog(self.timeline, self.info.has_audio, self.mark_in, self.mark_out, self)
@@ -357,35 +367,154 @@ class MainWindow(QMainWindow):
             return
         if Path(out).suffix.lower() not in allowed:  # add the extension of the chosen type
             out += "." + chosen_filter.split("*.")[-1].rstrip(")")
-        if os.path.abspath(out) == os.path.abspath(self.info.path):
-            QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
+        if not self._export_target_ok(out, opts.mode):
             return
         args = build_ffmpeg_args(ffmpeg, self.info, opts.segments, out, mode=opts.mode,
                                  overlays=self.timeline.overlays)
-        output_duration = sum(seg.output_duration for seg in opts.segments)
+        self._run_exports([(args, sum(seg.output_duration for seg in opts.segments), out)])
 
+    # ----------------------------------------------------- quick exports
+    def export_segment(self, index: int | None = None) -> None:
+        """Export one segment (with its speed, zoom, light and overlays) to a file."""
+        index = self.selected if index is None else index
+        if not self.info or not 0 <= index < len(self.timeline.segments):
+            return
+        seg = self.timeline.segments[index]
+        stem = Path(self.info.path).stem
+        self._quick_export([seg], f"{stem}_part{index + 1:02d}",
+                           f"Export segment {index + 1} ({format_time(seg.start)} – {format_time(seg.end)})",
+                           self.timeline.overlays)
+
+    def export_cut_part(self, start: float, end: float) -> None:
+        """Export a part that was cut out, as original footage (no edits, no overlays)."""
+        if not self.info:
+            return
+        stem = Path(self.info.path).stem
+        name = f"{stem}_cut_{format_time(start, millis=False)}-{format_time(end, millis=False)}"
+        self._quick_export([Segment(start, end)], name.replace(":", "."),
+                           f"Export cut-out part ({format_time(start)} – {format_time(end)})", [])
+
+    def _quick_export(self, segments: list[Segment], name: str, title: str, overlays) -> None:
+        """Ask for a file name and export; the file type decides video or sound only."""
+        ffmpeg = self._require_ffmpeg()
+        if not ffmpeg:
+            return
+        self.player.pause()
+        suggested = str(Path(self.info.path).with_name(name + ".mp4"))
+        out, chosen = QFileDialog.getSaveFileName(self, title, suggested, QUICK_EXPORT_FILTERS)
+        if not out:
+            return
+        ext = Path(out).suffix.lower()
+        if ext not in (".mp4", *AUDIO_FORMATS):
+            ext = "." + chosen.split("*.")[-1].rstrip(")")
+            out += ext
+        mode = ExportMode.AUDIO_ONLY if ext in AUDIO_FORMATS else ExportMode.VIDEO_AND_AUDIO
+        if not self._export_target_ok(out, mode):
+            return
+        args = build_ffmpeg_args(ffmpeg, self.info, segments, out, mode=mode, overlays=overlays)
+        self._run_exports([(args, sum(s.output_duration for s in segments), out)])
+
+    def export_all_segments(self) -> None:
+        """Export every segment as its own numbered file into a chosen folder."""
+        if not self.info or not self.timeline.segments:
+            return
+        ffmpeg = self._require_ffmpeg()
+        if not ffmpeg:
+            return
+        self.player.pause()
+        kinds = ["Video (MP4)", "Sound only (MP3)", "Sound only (WAV)"]
+        if not self.info.has_audio:
+            kinds = kinds[:1]
+        kind, ok = QInputDialog.getItem(
+            self, "Export all segments",
+            f"Save each of the {len(self.timeline.segments)} segments as a separate file:", kinds, 0, False)
+        if not ok:
+            return
+        folder = QFileDialog.getExistingDirectory(self, "Choose a folder for the files",
+                                                  str(Path(self.info.path).parent))
+        if not folder:
+            return
+        ext = {"Video (MP4)": ".mp4", "Sound only (MP3)": ".mp3", "Sound only (WAV)": ".wav"}[kind]
+        mode = ExportMode.VIDEO_AND_AUDIO if ext == ".mp4" else ExportMode.AUDIO_ONLY
+        stem = Path(self.info.path).stem
+        outs = [str(Path(folder) / f"{stem}_part{i + 1:02d}{ext}") for i in range(len(self.timeline.segments))]
+        existing = [o for o in outs if os.path.exists(o)]
+        if existing and QMessageBox.question(
+                self, "Replace files?",
+                f"{len(existing)} of these files already exist in this folder "
+                f"(e.g. {Path(existing[0]).name}). Replace them?") != QMessageBox.StandardButton.Yes:
+            return
+        jobs = []
+        for seg, out in zip(self.timeline.segments, outs):
+            args = build_ffmpeg_args(ffmpeg, self.info, [seg], out, mode=mode, overlays=self.timeline.overlays)
+            jobs.append((args, seg.output_duration, out))
+        self._run_exports(jobs, folder=folder)
+
+    def _require_ffmpeg(self) -> str | None:
+        ffmpeg = find_ffmpeg()
+        if not ffmpeg:
+            QMessageBox.critical(self, "FFmpeg not found", "Put ffmpeg.exe into the 'bin' folder next to the app.")
+        return ffmpeg
+
+    def _export_target_ok(self, out: str, mode: ExportMode) -> bool:
+        if os.path.abspath(out) == os.path.abspath(self.info.path):
+            QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
+            return False
+        if mode == ExportMode.AUDIO_ONLY and not self.info.has_audio:
+            QMessageBox.warning(self, "Export", "This video has no sound to export.")
+            return False
+        return True
+
+    def _run_exports(self, jobs: list[tuple[list[str], float, str]], folder: str | None = None) -> None:
+        """Run FFmpeg jobs one after another with one progress window.
+
+        Each job is ``(ffmpeg arguments, output duration, output file)``.
+        """
+        total = sum(max(d, 1e-3) for _a, d, _o in jobs)
         dialog = QProgressDialog("Exporting…", "Cancel", 0, 1000, self)
         dialog.setWindowTitle("Export")
         dialog.setWindowModality(Qt.WindowModality.WindowModal)
         dialog.setMinimumDuration(0)
         dialog.setAutoClose(False)
         dialog.setAutoReset(False)
+        state = {"index": 0, "done_seconds": 0.0, "cancelled": False}
 
-        runner = ExportRunner(args, output_duration, self)
-        runner.progress.connect(lambda f: dialog.setValue(int(f * 1000)))
-        dialog.canceled.connect(runner.cancel)
+        def cancel() -> None:
+            state["cancelled"] = True
+            if self._export is not None:
+                self._export.cancel()
 
-        def done(ok: bool, message: str) -> None:
-            dialog.close()
+        def start_next() -> None:
+            args, duration, out = jobs[state["index"]]
+            if len(jobs) > 1:
+                dialog.setLabelText(f"Exporting {state['index'] + 1} of {len(jobs)}: {Path(out).name}")
+            runner = ExportRunner(args, duration, self)
+            runner.progress.connect(
+                lambda f: dialog.setValue(int((state["done_seconds"] + f * duration) / total * 1000)))
+            runner.finished.connect(finished)
+            self._export = runner
+            runner.start()
+
+        def finished(ok: bool, message: str) -> None:
             self._export = None
-            if ok:
-                QMessageBox.information(self, "Export finished", f"Saved to:\n{out}")
-            elif message != "Export cancelled.":
+            if ok and not state["cancelled"]:
+                state["done_seconds"] += max(jobs[state["index"]][1], 1e-3)
+                state["index"] += 1
+                if state["index"] < len(jobs):
+                    start_next()
+                    return
+            cancelled = state["cancelled"]
+            dialog.canceled.disconnect(cancel)  # closing a QProgressDialog emits "canceled"
+            dialog.close()
+            if ok and not cancelled:
+                where = folder if folder else jobs[0][2]
+                what = f"{len(jobs)} files saved to:" if len(jobs) > 1 else "Saved to:"
+                QMessageBox.information(self, "Export finished", f"{what}\n{where}")
+            elif not cancelled and message != "Export cancelled.":
                 QMessageBox.critical(self, "Export failed", message)
 
-        runner.finished.connect(done)
-        self._export = runner
-        runner.start()
+        dialog.canceled.connect(cancel)
+        start_next()
 
     # =============================================================== playback
     def toggle_play(self) -> None:
@@ -713,6 +842,9 @@ class MainWindow(QMainWindow):
         self.act_undo.setEnabled(tl.can_undo)
         self.act_redo.setEnabled(tl.can_redo)
         self.btn_delete.setEnabled(has_sel or self.selected_overlay >= 0)
+        self.btn_export_segment.setEnabled(has_sel)
+        self.act_export_segment.setEnabled(has_sel)
+        self.act_export_all.setEnabled(loaded and len(tl.segments) > 1)
         self.btn_cut_range.setEnabled(has_marks)
         self.btn_keep_range.setEnabled(has_marks)
         for w in (self.speed_spin, self.zoom_spin, self.navigator, *self.preset_buttons, *self.zoom_buttons):

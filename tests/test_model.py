@@ -195,3 +195,16 @@ def test_overlay_without_audio_cannot_have_sound():
     tl = Timeline(10.0, 25)
     tl.add_overlay(Overlay("a.mp4", 5.0, 100, 100, has_audio=False, sound=True, length=2))
     assert tl.overlays[0].sound is False
+
+
+def test_gap_at_and_has_cuts():
+    tl = Timeline(10.0, 25)
+    assert not tl.has_cuts and tl.gap_at(5.0) is None
+    tl.split(5.0)
+    assert tl.has_cuts and tl.gap_at(5.0) is None
+    tl.undo()
+    tl.delete_range(2, 4)
+    tl.delete_range(8, 10)
+    assert tl.gap_at(3.0) == (2.0, 4.0)
+    assert tl.gap_at(9.0) == (8.0, 10.0)
+    assert tl.gap_at(1.0) is None and tl.gap_at(10.0) is None

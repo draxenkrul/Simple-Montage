@@ -162,6 +162,26 @@ class Timeline:
                 return i
         return None
 
+    def gap_at(self, t: float) -> tuple[float, float] | None:
+        """The cut-out part ``(start, end)`` containing ``t``, or None if ``t`` is kept."""
+        if not 0 <= t < self.duration or self.index_at(t) is not None:
+            return None
+        start, end = 0.0, self.duration
+        for seg in self.segments:
+            if seg.end <= t:
+                start = max(start, seg.end)
+            elif seg.start > t:
+                end = min(end, seg.start)
+        return start, end
+
+    @property
+    def has_cuts(self) -> bool:
+        """True once the video is split or something is cut out."""
+        return len(self.segments) > 1 or (
+            len(self.segments) == 1
+            and (self.segments[0].start > 0 or self.segments[0].end < self.duration)
+        )
+
     def cut_points(self) -> list[float]:
         """Sorted unique segment boundaries, including source start and end."""
         points = {0.0, self.duration}

@@ -5,6 +5,10 @@ The horizontal axis is *source* time. Kept segments are drawn as blocks
 
 Overlay clips (videos shown on top) appear on a lane under the main track.
 
+Once the video is split or cut, every kept segment shows a small export (⬇)
+button. Right-click opens a menu to export a segment, all segments, or a
+cut-out part.
+
 Mouse: click/drag to seek and select a segment, click an overlay to select it
 and drag it to move it in time, wheel to zoom, Shift+wheel to scroll.
 """
@@ -14,8 +18,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QWidget
+from PySide6.QtGui import QBrush, QColor, QCursor, QFont, QPainter, QPen, QPolygonF
+from PySide6.QtWidgets import QMenu, QToolTip, QWidget
 
 from simple_montage.model import Timeline
 from simple_montage.timecode import format_speed, format_time
@@ -42,6 +46,9 @@ class TimelineWidget(QWidget):
     segment_clicked = Signal(int)  # -1 when clicking a cut-out area
     overlay_clicked = Signal(int)
     overlay_moved = Signal(int, float)  # index, new start time
+    export_segment_requested = Signal(int)
+    export_all_requested = Signal()
+    export_cut_requested = Signal(float, float)  # a cut-out part: start, end
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -57,6 +64,8 @@ class TimelineWidget(QWidget):
         self._dragging = False
         self.setMinimumHeight(110)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setMouseTracking(True)  # for the export button's hover state
+        self._hover_export = -1
 
     # ------------------------------------------------------------ public API
     def reset_view(self) -> None:
@@ -90,6 +99,27 @@ class TimelineWidget(QWidget):
 
     def _lane(self) -> QRectF:
         return QRectF(0, self.height() - 8 - LANE_H, self.width(), LANE_H)
+
+    def _segment_rect(self, i: int) -> QRectF:
+        seg, track = self._tl.segments[i], self._main_track()
+        x0, x1 = self._x(seg.start), self._x(seg.end)
+        return QRectF(x0, track.top(), max(1.0, x1 - x0), track.height()).adjusted(0.5, 0, -0.5, 0)
+
+    def _export_button_rect(self, i: int) -> QRectF | None:
+        """The ⬇ button in a segment's top-right corner (None when hidden)."""
+        if not self._tl.has_cuts:
+            return None
+        rect = self._segment_rect(i)
+        if rect.width() < 40 or rect.right() < 0 or rect.left() > self.width():
+            return None
+        return QRectF(rect.right() - 24, rect.top() + 4, 20, 18)
+
+    def _export_button_at(self, pos: QPointF) -> int:
+        for i in range(len(self._tl.segments)):
+            r = self._export_button_rect(i)
+            if r is not None and r.contains(pos):
+                return i
+        return -1
 
     def _overlay_rect(self, i: int) -> QRectF:
         ov, lane = self._tl.overlays[i], self._lane()
@@ -160,6 +190,7 @@ class TimelineWidget(QWidget):
             if tags and rect.width() > 30:
                 p.setPen(Qt.GlobalColor.white)
                 p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "  ".join(tags))
+            self._paint_export_button(p, i)
 
         self._paint_overlays(p)
         self._paint_marks(p, track)
@@ -187,6 +218,23 @@ class TimelineWidget(QWidget):
                 label = label[2:]
             p.drawText(int(x) + 3, RULER_H - 8, label)
             t += step
+
+    def _paint_export_button(self, p: QPainter, i: int) -> None:
+        r = self._export_button_rect(i)
+        if r is None:
+            return
+        hover = i == self._hover_export
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(255, 255, 255, 230 if hover else 150))
+        p.drawRoundedRect(r, 4, 4)
+        # download arrow: shaft, head and a base line
+        c = QColor("#1e1f22")
+        p.setPen(QPen(c, 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        cx, top, bottom = r.center().x(), r.top() + 4, r.bottom() - 6
+        p.drawLine(QPointF(cx, top), QPointF(cx, bottom))
+        p.drawLine(QPointF(cx - 4, bottom - 4), QPointF(cx, bottom))
+        p.drawLine(QPointF(cx + 4, bottom - 4), QPointF(cx, bottom))
+        p.drawLine(QPointF(r.left() + 5, r.bottom() - 3), QPointF(r.right() - 5, r.bottom() - 3))
 
     def _paint_overlays(self, p: QPainter) -> None:
         for i, ov in enumerate(self._tl.overlays):
@@ -218,6 +266,11 @@ class TimelineWidget(QWidget):
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._tl.duration > 0:
             pos = event.position()
+            button = self._export_button_at(pos)
+            if button >= 0:
+                self.segment_clicked.emit(button)
+                self.export_segment_requested.emit(button)
+                return
             for i in range(len(self._tl.overlays) - 1, -1, -1):  # topmost first
                 if self._overlay_rect(i).contains(pos):
                     self._drag_overlay = (i, self._t(pos.x()) - self._tl.overlays[i].start)
@@ -230,6 +283,15 @@ class TimelineWidget(QWidget):
             self.seek_requested.emit(t)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        hover = self._export_button_at(event.position())
+        if hover != self._hover_export:
+            self._hover_export = hover
+            self.setCursor(Qt.CursorShape.PointingHandCursor if hover >= 0 else Qt.CursorShape.ArrowCursor)
+            if hover >= 0:
+                QToolTip.showText(QCursor.pos(), "Export this segment…", self)
+            else:
+                QToolTip.hideText()
+            self.update()
         if self._drag_overlay is not None:
             i, offset = self._drag_overlay
             self.overlay_moved.emit(i, self._t(event.position().x()) - offset)
@@ -239,6 +301,33 @@ class TimelineWidget(QWidget):
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
         self._dragging = False
         self._drag_overlay = None
+
+    def leaveEvent(self, _event) -> None:  # noqa: N802
+        if self._hover_export >= 0:
+            self._hover_export = -1
+            self.update()
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802
+        if self._tl.duration <= 0:
+            return
+        t = self._t(event.pos().x())
+        menu = QMenu(self)
+        index = self._tl.index_at(t)
+        if index is not None:
+            self.segment_clicked.emit(index)
+            seg = self._tl.segments[index]
+            menu.addAction(f"Export this segment ({format_time(seg.start)} – {format_time(seg.end)})…",
+                           lambda: self.export_segment_requested.emit(index))
+        else:
+            gap = self._tl.gap_at(t)
+            if gap is not None:
+                menu.addAction(f"Export this cut-out part, original ({format_time(gap[0])} – "
+                               f"{format_time(gap[1])})…", lambda: self.export_cut_requested.emit(*gap))
+        if len(self._tl.segments) > 1:
+            menu.addAction(f"Export all {len(self._tl.segments)} segments as separate files…",
+                           self.export_all_requested.emit)
+        if not menu.isEmpty():
+            menu.exec(event.globalPos())
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if self._tl.duration <= 0:

@@ -11,6 +11,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 - Put another video on top (picture-in-picture): size, position, timing, optional sound
 - Frame-exact preview with frame stepping; playback can preview the edit (skips cuts, applies speeds)
 - Export the whole timeline or only part of it (e.g. second 5 to 10)
+- One-click export of any single segment, of all segments as separate files, or of a cut-out part
 - Export video with sound, video without sound, or **sound only** (MP3 / WAV / M4A)
 - Preview volume slider and mute (remembered between runs)
 - Undo / redo
@@ -129,6 +130,8 @@ Click a block to select it, then delete it or change its speed.
 | Esc | Clear marks |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+O / Ctrl+E | Open / export |
+| Ctrl+Shift+E | Export selected segment |
+| Right-click timeline | Export menu (segment, all segments, cut-out part) |
 | Ctrl+Shift+O | Add overlay video |
 | Mouse wheel on timeline | Zoom (Shift+wheel scrolls) |
 
@@ -172,6 +175,25 @@ sped-up/slowed-down segments change its speed as well. Several overlays are allo
 overlap, the later one is on top (the preview shows the top one).
 
 ## Exporting
+
+### Quick: export one piece
+
+As soon as you split or cut the video, every kept segment on the timeline gets a small
+**⬇ button** in its corner. Click it, choose a file name and type, done:
+**MP4** = video with sound, **MP3 / WAV / M4A** = sound only.
+The segment is exported with its speed, zoom, lighting and any overlays.
+
+Other ways:
+- select a segment and click **⬇ Export segment** (or Ctrl+Shift+E)
+- **right-click** the timeline:
+  - on a segment → *Export this segment…*
+  - anywhere → *Export all segments as separate files…* (choose MP4, MP3 or WAV and a folder;
+    you get `name_part01.mp4`, `name_part02.mp4`, …)
+  - on a cut-out (striped) part → *Export this cut-out part, original…* — saves the piece you
+    removed, unedited
+- **File → Export all segments separately…**
+
+### Full export window
 
 **File → Export…** (Ctrl+E) opens the export window:
 
