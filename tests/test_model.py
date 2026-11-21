@@ -130,3 +130,68 @@ def test_zoom_is_clamped_and_merges_into_one_undo_step():
     assert tl.segments[0].pan_y == 0.0
     tl.undo()
     assert tl.segments[0].zoom == 1.0 and tl.segments[0].pan_x == 0.5
+
+
+def test_light_set_clamp_merge_and_split():
+    tl = Timeline(10.0, 25)
+    assert not tl.segments[0].has_light
+    tl.set_light(0, brightness=0.1)
+    tl.set_light(0, brightness=0.2, contrast=9)      # merged, clamped
+    seg = tl.segments[0]
+    assert (seg.brightness, seg.contrast) == (0.2, 2.0) and seg.has_light
+    tl.split(5.0)
+    assert all(s.brightness == 0.2 for s in tl.segments)
+    tl.undo(); tl.undo()
+    assert not tl.segments[0].has_light
+
+
+def test_reset_light():
+    tl = Timeline(10.0, 25)
+    tl.set_light(0, saturation=0.0, gamma=1.5)
+    assert tl.reset_light(0) and not tl.segments[0].has_light
+
+
+def _overlay(**kw):
+    from simple_montage.model import Overlay
+    return Overlay("pip.mp4", file_duration=6.0, width=640, height=360, has_audio=True, **kw)
+
+
+def test_overlay_is_clamped_to_main_and_file():
+    tl = Timeline(10.0, 25)
+    i = tl.add_overlay(_overlay(start=8.0, length=100))
+    assert tl.overlays[i].length == pytest.approx(2.0)          # main ends at 10
+    tl.update_overlay(i, start=1.0, in_point=5.0, length=100)
+    assert tl.overlays[i].length == pytest.approx(1.0)          # file has 1 s left
+    tl.update_overlay(i, scale=5, pos_x=-1)
+    assert (tl.overlays[i].scale, tl.overlays[i].pos_x) == (1.0, 0.0)
+
+
+def test_overlay_at_and_file_time():
+    tl = Timeline(10.0, 25)
+    tl.add_overlay(_overlay(start=2.0, length=3.0, in_point=1.0))
+    assert tl.overlay_at(1.0) is None and tl.overlay_at(2.0) == 0 and tl.overlay_at(5.0) is None
+    assert tl.overlays[0].file_time(3.5) == pytest.approx(2.5)
+
+
+def test_overlay_undo_redo_and_reset():
+    tl = Timeline(10.0, 25)
+    tl.add_overlay(_overlay(start=1.0, length=2.0))
+    tl.update_overlay(0, start=2.0)
+    tl.update_overlay(0, start=3.0)          # merged with the previous move
+    tl.undo()
+    assert tl.overlays[0].start == 1.0
+    tl.undo()
+    assert tl.overlays == []
+    tl.redo()
+    assert len(tl.overlays) == 1
+    tl.remove_overlay(0)
+    assert tl.overlays == []
+    tl.reset(10.0, 25)
+    assert tl.overlays == [] and not tl.can_undo
+
+
+def test_overlay_without_audio_cannot_have_sound():
+    from simple_montage.model import Overlay
+    tl = Timeline(10.0, 25)
+    tl.add_overlay(Overlay("a.mp4", 5.0, 100, 100, has_audio=False, sound=True, length=2))
+    assert tl.overlays[0].sound is False

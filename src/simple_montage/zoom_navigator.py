@@ -1,7 +1,8 @@
-"""Small map of the video frame for choosing the visible area when zoomed.
+"""Small map of the video frame with a draggable box.
 
-The outer rectangle is the whole frame, the highlighted box is the part that
-is shown. Drag the box (or click anywhere) to move it; double-click to centre.
+Used to choose the visible area when zoomed (the box is the part that is
+shown) and to place an overlay video (the box is the overlay). Drag the box
+(or click anywhere) to move it; double-click to centre.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ class ZoomNavigator(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._zoom, self._pan_x, self._pan_y = 1.0, 0.5, 0.5
+        self._bw, self._bh, self._pan_x, self._pan_y = 1.0, 1.0, 0.5, 0.5
         self._aspect = 16 / 9
         self.setFixedSize(128, 72)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -30,8 +31,18 @@ class ZoomNavigator(QWidget):
             self.update()
 
     def set_view(self, zoom: float, pan_x: float, pan_y: float) -> None:
-        self._zoom, self._pan_x, self._pan_y = zoom, pan_x, pan_y
+        """Zoom mode: the box is 1/zoom of the frame."""
+        self.set_box(1.0 / zoom, 1.0 / zoom, pan_x, pan_y)
+
+    def set_box(self, width: float, height: float, pos_x: float, pos_y: float) -> None:
+        """Box size as fractions of the frame, position 0..1 (0 = left/top edge)."""
+        self._bw, self._bh = min(width, 1.0), min(height, 1.0)
+        self._pan_x, self._pan_y = pos_x, pos_y
         self.update()
+
+    @property
+    def _movable(self) -> bool:
+        return self._bw < 1.0 - 1e-9 or self._bh < 1.0 - 1e-9
 
     # ------------------------------------------------------------ geometry
     def _frame(self) -> QRectF:
@@ -43,7 +54,7 @@ class ZoomNavigator(QWidget):
         return QRectF((self.width() - fw) / 2, (self.height() - fh) / 2, fw, fh)
 
     def _box(self, frame: QRectF) -> QRectF:
-        bw, bh = frame.width() / self._zoom, frame.height() / self._zoom
+        bw, bh = frame.width() * self._bw, frame.height() * self._bh
         return QRectF(frame.left() + (frame.width() - bw) * self._pan_x,
                       frame.top() + (frame.height() - bh) * self._pan_y, bw, bh)
 
@@ -62,7 +73,7 @@ class ZoomNavigator(QWidget):
             p.drawLine(int(frame.left()), int(y), int(frame.right()), int(y))
         p.setPen(QPen(QColor("#6d6f78"), 1))
         p.drawRect(frame)
-        if self._zoom > 1.0 + 1e-9:
+        if self._movable:
             box = self._box(frame)
             fill = QColor("#3d7bd9" if enabled else "#555555")
             fill.setAlpha(110)
@@ -85,12 +96,12 @@ class ZoomNavigator(QWidget):
                 axis(y, frame.top(), frame.height(), box.height()))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and self._zoom > 1.0:
+        if event.button() == Qt.MouseButton.LeftButton and self._movable:
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
             self.view_changed.emit(*self._pan_from(event.position().x(), event.position().y()))
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if event.buttons() & Qt.MouseButton.LeftButton and self._zoom > 1.0:
+        if event.buttons() & Qt.MouseButton.LeftButton and self._movable:
             self.view_changed.emit(*self._pan_from(event.position().x(), event.position().y()))
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802

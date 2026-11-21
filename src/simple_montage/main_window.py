@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QPushButton,
     QSlider,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -28,8 +29,9 @@ from PySide6.QtWidgets import (
 from simple_montage.export import AUDIO_FORMATS, ExportMode, build_ffmpeg_args
 from simple_montage.export_dialog import ExportDialog
 from simple_montage.export_runner import ExportRunner
-from simple_montage.model import MAX_SPEED, MAX_ZOOM, MIN_SPEED, MIN_ZOOM, Timeline
-from simple_montage.player import MpvPlayer, VideoFrame
+from simple_montage.model import MAX_SPEED, MAX_ZOOM, MIN_SPEED, MIN_ZOOM, Overlay, Timeline
+from simple_montage.panels import LightPanel, OverlayPanel
+from simple_montage.player import MpvPlayer, OverlayPreview, VideoFrame
 from simple_montage.probe import MediaInfo, ProbeError, probe
 from simple_montage.timecode import format_speed, format_time
 from simple_montage.timeline_widget import TimelineWidget
@@ -56,6 +58,8 @@ class MainWindow(QMainWindow):
         self.mark_in: float | None = None
         self.mark_out: float | None = None
         self.selected = -1
+        self.selected_overlay = -1
+        self.muted = False
         self.playback_rate = 1.0
         self._skip_target: float | None = None
         self._skip_started = 0.0
@@ -63,6 +67,7 @@ class MainWindow(QMainWindow):
 
         self.player = MpvPlayer()
         self.video_frame = VideoFrame(self.player)
+        self.overlay_preview = OverlayPreview(self.video_frame, lambda: self._update_player_view())
         self.timeline_view = TimelineWidget(self.timeline)
 
         self._build_actions()
@@ -85,6 +90,7 @@ class MainWindow(QMainWindow):
     def _build_actions(self) -> None:
         m_file = self.menuBar().addMenu("&File")
         self.act_open = self._action("&Open video…", QKeySequence.StandardKey.Open, self.open_dialog, m_file)
+        self.act_add_overlay = self._action("Add &overlay video…", "Ctrl+Shift+O", self.add_overlay_dialog, m_file)
         self.act_export = self._action("&Export…", "Ctrl+E", self.export_dialog, m_file)
         m_file.addSeparator()
         self._action("&Quit", QKeySequence.StandardKey.Quit, self.close, m_file)
@@ -94,7 +100,7 @@ class MainWindow(QMainWindow):
         self.act_redo = self._action("&Redo", ["Ctrl+Y", "Ctrl+Shift+Z"], self.redo, m_edit)
         m_edit.addSeparator()
         self.act_split = self._action("&Split at playhead", "S", self.split, m_edit)
-        self.act_delete = self._action("&Delete selected segment", [QKeySequence.StandardKey.Delete, "Backspace"],
+        self.act_delete = self._action("&Delete selected segment / overlay", [QKeySequence.StandardKey.Delete, "Backspace"],
                                        self.delete_selected, m_edit)
         m_edit.addSeparator()
         self._action("Set &In mark", "I", self.set_in, m_edit)
@@ -210,9 +216,9 @@ class MainWindow(QMainWindow):
                   self.btn_cut_range, self.btn_keep_range):
             edit_row.addWidget(w)
         edit_row.addStretch()
+        edit_row.addWidget(self.segment_label)
 
         segment_row = QHBoxLayout()
-        segment_row.addWidget(self.segment_label)
         segment_row.addStretch()
         segment_row.addWidget(QLabel("Segment speed:"))
         segment_row.addWidget(self.speed_spin)
@@ -231,14 +237,25 @@ class MainWindow(QMainWindow):
         zoom_row.addWidget(self.btn_center)
         zoom_row.addWidget(self.navigator)
 
+        speed_zoom_page = QWidget()
+        sz = QVBoxLayout(speed_zoom_page)
+        sz.addLayout(segment_row)
+        sz.addLayout(zoom_row)
+        self.light_panel = LightPanel()
+        self.overlay_panel = OverlayPanel()
+        self.tabs = QTabWidget()
+        self.tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.tabs.addTab(speed_zoom_page, "⏩ Speed && Zoom")
+        self.tabs.addTab(self.light_panel, "☀ Light")
+        self.tabs.addTab(self.overlay_panel, "🖼 Overlay video")
+
         central = QWidget()
         layout = QVBoxLayout(central)
         layout.addWidget(self.video_frame, stretch=1)
         layout.addLayout(transport)
         layout.addWidget(self.timeline_view)
         layout.addLayout(edit_row)
-        layout.addLayout(segment_row)
-        layout.addLayout(zoom_row)
+        layout.addWidget(self.tabs)
         self.setCentralWidget(central)
 
         self.output_label = QLabel()
@@ -250,6 +267,13 @@ class MainWindow(QMainWindow):
         self.player.file_loaded.connect(lambda: self.seek(0))
         self.timeline_view.seek_requested.connect(self.seek)
         self.timeline_view.segment_clicked.connect(self.select)
+        self.timeline_view.overlay_clicked.connect(self.select_overlay)
+        self.timeline_view.overlay_moved.connect(lambda i, t: self.change_overlay({"start": t}))
+        self.light_panel.light_changed.connect(self.set_segment_light)
+        self.light_panel.reset_requested.connect(self.reset_segment_light)
+        self.overlay_panel.add_requested.connect(self.add_overlay_dialog)
+        self.overlay_panel.delete_requested.connect(self.delete_overlay)
+        self.overlay_panel.overlay_changed.connect(self.change_overlay)
         self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
         self.preview_edits.toggled.connect(lambda _: (self._update_player_speed(), self._update_player_view()))
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
@@ -279,8 +303,11 @@ class MainWindow(QMainWindow):
         self.position = 0.0
         self.mark_in = self.mark_out = None
         self.selected = -1
+        self.selected_overlay = -1
+        self.overlay_preview.hide()
         self.timeline_view.reset_view()
         aspect = info.width * float(Fraction(info.sar)) / info.height if info.height else 16 / 9
+        self.aspect = aspect
         self.video_frame.set_aspect(aspect)
         self.navigator.set_aspect(aspect)
         self.player.set_view(1.0, 0.5, 0.5)
@@ -333,7 +360,8 @@ class MainWindow(QMainWindow):
         if os.path.abspath(out) == os.path.abspath(self.info.path):
             QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
             return
-        args = build_ffmpeg_args(ffmpeg, self.info, opts.segments, out, mode=opts.mode)
+        args = build_ffmpeg_args(ffmpeg, self.info, opts.segments, out, mode=opts.mode,
+                                 overlays=self.timeline.overlays)
         output_duration = sum(seg.output_duration for seg in opts.segments)
 
         dialog = QProgressDialog("Exporting…", "Cancel", 0, 1000, self)
@@ -414,15 +442,25 @@ class MainWindow(QMainWindow):
     def _update_player_view(self, t: float | None = None) -> None:
         """Preview the zoom of the segment under the playhead."""
         t = self.position if t is None else t
-        i = self.timeline.index_at(t) if self.preview_edits.isChecked() else None
+        preview = self.preview_edits.isChecked()
+        i = self.timeline.index_at(t) if preview else None
         if i is None:
             self.player.set_view(1.0, 0.5, 0.5)
+            self.player.set_light(None)
         else:
             seg = self.timeline.segments[i]
             self.player.set_view(seg.zoom, seg.pan_x, seg.pan_y)
+            self.player.set_light(seg.light if seg.has_light else None)
+        k = self.timeline.overlay_at(t) if preview else None
+        self.overlay_preview.update(
+            None if k is None else self.timeline.overlays[k], t,
+            playing=not self.player.paused, speed=self.player.speed,
+            volume=self.volume_slider.value(), muted=self.muted,
+        )
 
     def _on_pause_changed(self, paused: bool) -> None:
         self.btn_play.setText("▶" if paused else "⏸")
+        self._update_player_view()
 
     def _on_position(self, t: float) -> None:
         self.position = t
@@ -466,6 +504,8 @@ class MainWindow(QMainWindow):
 
     def _on_volume_changed(self, value: int) -> None:
         self.player.set_volume(value)
+        if self.info:
+            self._update_player_view()
         self.volume_label.setText(f"{value}%")
         if self.muted and value > 0:  # moving the slider unmutes, like most players
             self.toggle_mute()
@@ -478,6 +518,8 @@ class MainWindow(QMainWindow):
         self.muted = not self.muted
         self.player.set_muted(self.muted)
         self._update_mute_button()
+        if self.info:
+            self._update_player_view()
 
     def _update_mute_button(self) -> None:
         silent = self.muted or self.volume_slider.value() == 0
@@ -486,6 +528,15 @@ class MainWindow(QMainWindow):
     # ================================================================ editing
     def select(self, index: int) -> None:
         self.selected = index
+        self.selected_overlay = -1
+        if index >= 0 and self.tabs.currentWidget() is self.overlay_panel:
+            self.tabs.setCurrentIndex(0)
+        self._refresh()
+
+    def select_overlay(self, index: int) -> None:
+        self.selected_overlay = index
+        self.selected = -1
+        self.tabs.setCurrentWidget(self.overlay_panel)
         self._refresh()
 
     def split(self) -> None:
@@ -495,6 +546,9 @@ class MainWindow(QMainWindow):
             self._refresh()
 
     def delete_selected(self) -> None:
+        if self.selected_overlay >= 0:
+            self.delete_overlay()
+            return
         if self.timeline.delete(self.selected):
             self.selected = -1
             self._refresh()
@@ -563,15 +617,60 @@ class MainWindow(QMainWindow):
                 self._update_player_view()
                 self._refresh()
 
+    # ------------------------------------------------------------- lighting
+    def set_segment_light(self, values: dict) -> None:
+        if self.timeline.set_light(self.selected, **values):
+            self._show_selected()
+            self._update_player_view()
+            self._refresh()
+
+    def reset_segment_light(self) -> None:
+        if self.timeline.reset_light(self.selected):
+            self._update_player_view()
+            self._refresh()
+
+    # ------------------------------------------------------------- overlays
+    def add_overlay_dialog(self) -> None:
+        if not self.info:
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Add overlay video", "", VIDEO_FILTER)
+        if path:
+            self.add_overlay(path)
+
+    def add_overlay(self, path: str) -> None:
+        """Put ``path`` on top of the main video, starting at the playhead."""
+        try:
+            info = probe(find_ffprobe() or "ffprobe", path)
+        except (ProbeError, OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Cannot use this video", str(exc))
+            return
+        index = self.timeline.add_overlay(Overlay(
+            path, info.duration, info.width, info.height, info.has_audio,
+            start=self.position, length=info.duration,
+        ))
+        self.select_overlay(index)
+        self._update_player_view()
+
+    def change_overlay(self, changes: dict) -> None:
+        if self.timeline.update_overlay(self.selected_overlay, **changes):
+            self._update_player_view()
+            self._refresh()
+
+    def delete_overlay(self) -> None:
+        if self.timeline.remove_overlay(self.selected_overlay):
+            self.selected_overlay = -1
+            self._update_player_view()
+            self._refresh()
+
     def undo(self) -> None:
         if self.timeline.undo():
-            self.selected = -1
+            self.selected = self.selected_overlay = -1
             self._update_player_view()
             self._refresh()
 
     def redo(self) -> None:
         if self.timeline.redo():
-            self.selected = -1
+            self.selected = self.selected_overlay = -1
             self._update_player_view()
             self._refresh()
 
@@ -592,10 +691,19 @@ class MainWindow(QMainWindow):
         loaded = self.info is not None
         if self.selected >= len(tl.segments):
             self.selected = -1
+        if self.selected_overlay >= len(tl.overlays):
+            self.selected_overlay = -1
         has_sel = self.selected >= 0
         has_marks = self.mark_in is not None or self.mark_out is not None
 
         self.timeline_view.set_selected(self.selected)
+        self.timeline_view.set_selected_overlay(self.selected_overlay)
+        self.light_panel.set_segment(tl.segments[self.selected] if self.selected >= 0 else None)
+        self.overlay_panel.set_overlay(
+            tl.overlays[self.selected_overlay] if self.selected_overlay >= 0 else None,
+            getattr(self, "aspect", 16 / 9), tl.duration)
+        self.overlay_panel.add_button.setEnabled(loaded)
+        self.act_add_overlay.setEnabled(loaded)
         self.timeline_view.set_marks(self.mark_in, self.mark_out)
         self.timeline_view.update()
 
@@ -604,7 +712,7 @@ class MainWindow(QMainWindow):
         self.act_export.setEnabled(loaded and bool(tl.segments))
         self.act_undo.setEnabled(tl.can_undo)
         self.act_redo.setEnabled(tl.can_redo)
-        self.btn_delete.setEnabled(has_sel)
+        self.btn_delete.setEnabled(has_sel or self.selected_overlay >= 0)
         self.btn_cut_range.setEnabled(has_marks)
         self.btn_keep_range.setEnabled(has_marks)
         for w in (self.speed_spin, self.zoom_spin, self.navigator, *self.preset_buttons, *self.zoom_buttons):
@@ -624,7 +732,10 @@ class MainWindow(QMainWindow):
             self.navigator.set_view(seg.zoom, seg.pan_x, seg.pan_y)
         else:
             self.navigator.set_view(1.0, 0.5, 0.5)
-            self.segment_label.setText("Click a segment on the timeline to select it" if loaded else "")
+            if self.selected_overlay >= 0:
+                self.segment_label.setText(f"Overlay {self.selected_overlay + 1}/{len(tl.overlays)} selected")
+            else:
+                self.segment_label.setText("Click a segment on the timeline to select it" if loaded else "")
 
         if loaded:
             self.output_label.setText(
@@ -640,5 +751,6 @@ class MainWindow(QMainWindow):
         settings = QSettings("SimpleMontage", "SimpleMontage")
         settings.setValue("volume", self.volume_slider.value())
         settings.setValue("muted", self.muted)
+        self.overlay_preview.shutdown()
         self.player.shutdown()
         super().closeEvent(event)

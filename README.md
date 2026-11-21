@@ -7,6 +7,8 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 - Split the video at the playhead, delete parts, or cut/keep an In→Out range
 - Give every segment its own speed (0.1× – 10×), audio keeps its pitch
 - Zoom into the picture per segment (1× – 5×) and choose which part is shown
+- Adjust lighting per segment: brightness, contrast, saturation, gamma
+- Put another video on top (picture-in-picture): size, position, timing, optional sound
 - Frame-exact preview with frame stepping; playback can preview the edit (skips cuts, applies speeds)
 - Export the whole timeline or only part of it (e.g. second 5 to 10)
 - Export video with sound, video without sound, or **sound only** (MP3 / WAV / M4A)
@@ -120,13 +122,14 @@ Click a block to select it, then delete it or change its speed.
 | + / − | Preview volume up / down |
 | M | Mute / unmute preview |
 | S | Split at playhead |
-| Del | Delete selected segment |
+| Del | Delete selected segment or overlay |
 | I / O | Set In / Out mark |
 | X | Cut out In→Out |
 | K | Keep only In→Out |
 | Esc | Clear marks |
 | Ctrl+Z / Ctrl+Y | Undo / redo |
 | Ctrl+O / Ctrl+E | Open / export |
+| Ctrl+Shift+O | Add overlay video |
 | Mouse wheel on timeline | Zoom (Shift+wheel scrolls) |
 
 ## Zooming
@@ -141,6 +144,32 @@ Every segment can be zoomed into, just like it can have its own speed:
 The preview shows the zoom immediately (with *Preview edits* ticked), and the export keeps
 exactly that area, scaled back up to the original resolution. To zoom only one moment, split
 the video around it (**S**) and zoom just that segment. Zoomed segments show 🔍 on the timeline.
+
+## Lighting
+
+Open the **☀ Light** tab. The sliders change the **selected segment**:
+brightness, contrast, saturation (colour) and gamma (shadows / midtones).
+To change only part of the video, split it (**S**) at the start and end of that part, then
+select the piece in the middle. **Reset light** goes back to the original look.
+Segments with changed lighting show ☀ on the timeline. The preview uses the same filter as the
+export, so what you see is what you get.
+
+## Overlay video (picture-in-picture)
+
+1. Move the playhead to where the overlay should appear.
+2. **File → Add overlay video…** (Ctrl+Shift+O), or the **🖼 Overlay video** tab → *Add overlay video…*.
+3. It appears as a purple block under the timeline and in the preview (bottom-right, 35% wide).
+4. In the **Overlay video** tab:
+   - **Size** slider — width compared to the main picture
+   - drag the box in the frame map, or use the corner buttons, to **place** it
+   - **Show at / for / starting from its second** — when it appears, how long, and which part
+     of the overlay video is used
+   - **Mix in its sound** — otherwise only the main video's sound is used
+5. Drag the purple block on the timeline to move it in time; **Del** removes the selected overlay.
+
+The overlay follows your edit of the main video: parts you cut out are skipped for it too, and
+sped-up/slowed-down segments change its speed as well. Several overlays are allowed; where they
+overlap, the later one is on top (the preview shows the top one).
 
 ## Exporting
 
@@ -178,7 +207,8 @@ src/simple_montage/
   player.py           libmpv preview widget
   timeline_widget.py  custom-painted timeline
   export_dialog.py    export window (range, video/sound)
-  zoom_navigator.py   frame map for choosing the zoomed area
+  zoom_navigator.py   frame map for choosing the zoomed area / overlay position
+  panels.py           Light and Overlay tabs
   model.py            edit model (segments, speeds, undo/redo) — no GUI code
   export.py           builds the FFmpeg command — no GUI code
   export_runner.py    runs FFmpeg in the background with progress

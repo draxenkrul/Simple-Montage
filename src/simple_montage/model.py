@@ -1,8 +1,10 @@
-"""Edit model: which parts of the source video are kept, and at what speed.
+"""Edit model: which parts of the source video are kept, and how they look.
 
 The timeline is expressed in *source* time. It holds an ordered list of
 non-overlapping :class:`Segment` objects. Anything not covered by a segment is
-cut out of the final video. Every segment has its own playback speed.
+cut out of the final video. Every segment has its own speed, zoom and
+lighting. :class:`Overlay` clips are other videos shown on top of the main
+one, placed on the same source-time axis.
 
 This module has no Qt or FFmpeg dependency so it can be unit-tested directly.
 """
@@ -18,6 +20,17 @@ MAX_SPEED = 10.0
 MIN_ZOOM = 1.0
 MAX_ZOOM = 5.0
 
+# Lighting, in FFmpeg "eq" filter units: name -> (minimum, default, maximum)
+LIGHT_RANGES = {
+    "brightness": (-0.5, 0.0, 0.5),
+    "contrast": (0.5, 1.0, 2.0),
+    "saturation": (0.0, 1.0, 2.0),
+    "gamma": (0.5, 1.0, 2.0),
+}
+
+MIN_OVERLAY_SCALE = 0.05
+MAX_OVERLAY_SCALE = 1.0
+
 
 @dataclass
 class Segment:
@@ -26,6 +39,9 @@ class Segment:
     ``zoom`` magnifies the picture (1 = whole frame, 2 = half the width and
     height, ...). ``pan_x``/``pan_y`` choose which part is shown when zoomed:
     0 = left/top edge, 0.5 = centre, 1 = right/bottom edge.
+
+    ``brightness``/``contrast``/``saturation``/``gamma`` adjust the lighting
+    (see :data:`LIGHT_RANGES`).
     """
 
     start: float
@@ -34,6 +50,18 @@ class Segment:
     zoom: float = 1.0
     pan_x: float = 0.5
     pan_y: float = 0.5
+    brightness: float = 0.0
+    contrast: float = 1.0
+    saturation: float = 1.0
+    gamma: float = 1.0
+
+    @property
+    def light(self) -> dict[str, float]:
+        return {name: getattr(self, name) for name in LIGHT_RANGES}
+
+    @property
+    def has_light(self) -> bool:
+        return any(abs(getattr(self, n) - d) > 1e-9 for n, (_lo, d, _hi) in LIGHT_RANGES.items())
 
     @property
     def source_duration(self) -> float:
@@ -45,6 +73,48 @@ class Segment:
 
     def contains(self, t: float) -> bool:
         return self.start <= t < self.end
+
+
+@dataclass
+class Overlay:
+    """Another video shown on top of the main one (picture-in-picture).
+
+    It is shown while the main video is between ``start`` and
+    ``start + length`` (main source seconds) and plays its own file from
+    ``in_point``. Because it is tied to the main source time, cuts and speed
+    changes of the main video apply to it too.
+
+    ``scale`` is its width as a fraction of the main picture width.
+    ``pos_x``/``pos_y`` place it: 0 = left/top edge, 1 = right/bottom edge.
+    """
+
+    path: str
+    file_duration: float
+    width: int
+    height: int
+    has_audio: bool
+    start: float = 0.0
+    in_point: float = 0.0
+    length: float = 0.0
+    scale: float = 0.35
+    pos_x: float = 0.95
+    pos_y: float = 0.95
+    sound: bool = False
+
+    @property
+    def end(self) -> float:
+        return self.start + self.length
+
+    @property
+    def aspect(self) -> float:
+        return self.width / self.height if self.width and self.height else 16 / 9
+
+    def active_at(self, t: float) -> bool:
+        return self.start <= t < self.end
+
+    def file_time(self, t: float) -> float:
+        """Time in the overlay's own file shown at main source time ``t``."""
+        return self.in_point + (t - self.start)
 
 
 class Timeline:
@@ -61,8 +131,9 @@ class Timeline:
         self.segments: list[Segment] = (
             [Segment(0.0, self.duration)] if self.duration > 0 else []
         )
-        self._undo: list[list[Segment]] = []
-        self._redo: list[list[Segment]] = []
+        self.overlays: list[Overlay] = []
+        self._undo: list[tuple[list[Segment], list[Overlay]]] = []
+        self._redo: list[tuple[list[Segment], list[Overlay]]] = []
         self._last_op: object = None
 
     # -------------------------------------------------------------- utilities
@@ -212,6 +283,79 @@ class Timeline:
         seg.zoom, seg.pan_x, seg.pan_y = zoom, pan_x, pan_y
         return True
 
+    def set_light(self, index: int, **values: float) -> bool:
+        """Change lighting of one segment, e.g. ``set_light(0, brightness=0.1)``.
+
+        Repeated changes (dragging a slider) merge into one undo step.
+        """
+        if not 0 <= index < len(self.segments):
+            return False
+        seg = self.segments[index]
+        changes = {}
+        for name, value in values.items():
+            lo, _default, hi = LIGHT_RANGES[name]
+            value = min(max(float(value), lo), hi)
+            if abs(getattr(seg, name) - value) > 1e-9:
+                changes[name] = value
+        if not changes:
+            return False
+        self._checkpoint(op=("light", index))
+        for name, value in changes.items():
+            setattr(seg, name, value)
+        return True
+
+    def reset_light(self, index: int) -> bool:
+        return self.set_light(index, **{n: d for n, (_lo, d, _hi) in LIGHT_RANGES.items()})
+
+    # --------------------------------------------------------------- overlays
+    def add_overlay(self, overlay: Overlay) -> int:
+        """Add an overlay (clamped to fit). Returns its index."""
+        self._checkpoint()
+        self.overlays.append(overlay)
+        self._clamp_overlay(overlay)
+        return len(self.overlays) - 1
+
+    def remove_overlay(self, index: int) -> bool:
+        if not 0 <= index < len(self.overlays):
+            return False
+        self._checkpoint()
+        del self.overlays[index]
+        return True
+
+    def update_overlay(self, index: int, **changes) -> bool:
+        """Change overlay fields (start, in_point, length, scale, pos_x, pos_y, sound).
+
+        Repeated changes to the same overlay (dragging) merge into one undo step.
+        """
+        if not 0 <= index < len(self.overlays):
+            return False
+        ov = self.overlays[index]
+        trial = replace(ov, **changes)
+        self._clamp_overlay(trial)
+        if trial == ov:
+            return False
+        self._checkpoint(op=("overlay", index))
+        self.overlays[index] = trial
+        return True
+
+    def _clamp_overlay(self, ov: Overlay) -> None:
+        frame = self.frame_duration
+        ov.start = self.snap(min(max(ov.start, 0.0), max(0.0, self.duration - frame)))
+        ov.in_point = min(max(ov.in_point, 0.0), max(0.0, ov.file_duration - frame))
+        longest = min(ov.file_duration - ov.in_point, self.duration - ov.start)
+        ov.length = min(max(ov.length, frame), max(frame, longest))
+        ov.scale = min(max(ov.scale, MIN_OVERLAY_SCALE), MAX_OVERLAY_SCALE)
+        ov.pos_x = min(max(ov.pos_x, 0.0), 1.0)
+        ov.pos_y = min(max(ov.pos_y, 0.0), 1.0)
+        ov.sound = bool(ov.sound) and ov.has_audio
+
+    def overlay_at(self, t: float) -> int | None:
+        """Index of the topmost overlay shown at source time ``t``."""
+        for i in range(len(self.overlays) - 1, -1, -1):
+            if self.overlays[i].active_at(t):
+                return i
+        return None
+
     def _without_range(self, segments: list[Segment], a: float, b: float) -> list[Segment]:
         min_len = self.frame_duration * 0.5
         result: list[Segment] = []
@@ -234,9 +378,12 @@ class Timeline:
         """
         if op is not None and op == self._last_op:
             return
-        self._undo.append(copy.deepcopy(self.segments))
+        self._undo.append(self._snapshot())
         self._redo.clear()
         self._last_op = op
+
+    def _snapshot(self) -> tuple[list[Segment], list[Overlay]]:
+        return copy.deepcopy((self.segments, self.overlays))
 
     @property
     def can_undo(self) -> bool:
@@ -249,15 +396,15 @@ class Timeline:
     def undo(self) -> bool:
         if not self._undo:
             return False
-        self._redo.append(copy.deepcopy(self.segments))
-        self.segments = self._undo.pop()
+        self._redo.append(self._snapshot())
+        self.segments, self.overlays = self._undo.pop()
         self._last_op = None
         return True
 
     def redo(self) -> bool:
         if not self._redo:
             return False
-        self._undo.append(copy.deepcopy(self.segments))
-        self.segments = self._redo.pop()
+        self._undo.append(self._snapshot())
+        self.segments, self.overlays = self._redo.pop()
         self._last_op = None
         return True

@@ -104,3 +104,34 @@ def test_zoom_filter():
 
 def test_no_zoom_filter_at_1x():
     assert "crop" not in build_filter_graph([Segment(0, 10)], info())
+
+
+def test_light_filter_in_graph():
+    seg = Segment(0, 10, brightness=0.1, contrast=1.2)
+    assert ",eq=brightness=0.1:contrast=1.2:saturation=1:gamma=1[v0]" in build_filter_graph([seg], info())
+    assert "eq=" not in build_filter_graph([Segment(0, 10)], info())
+
+
+def test_overlay_inputs_and_graph():
+    from simple_montage.export import build_export
+    from simple_montage.model import Overlay
+    ov = Overlay("pip.mp4", 8.0, 640, 360, True, start=3.0, in_point=1.0, length=4.0,
+                 scale=0.25, pos_x=1.0, pos_y=0.0, sound=True)
+    segs = [Segment(0, 5), Segment(5, 10, speed=2.0)]
+    inputs, graph = build_export(segs, info(), overlays=[ov])
+    # overlay main 3-7: 3-5 in segment 0, 5-7 in segment 1 (file 1-3 and 3-5)
+    assert inputs == [["-ss", "1", "-t", "2", "-i", "pip.mp4"], ["-ss", "3", "-t", "2", "-i", "pip.mp4"]]
+    assert "[1:v:0]setpts=(PTS-STARTPTS)/1+3/TB,scale=480:-2:flags=lanczos[ov0_0]" in graph
+    assert "[2:v:0]setpts=(PTS-STARTPTS)/2+0/TB" in graph
+    assert "enable='between(t,0,1)'" in graph            # 2 s at 2x -> first second of segment 1
+    assert "overlay=x=(main_w-overlay_w)*1:y=(main_h-overlay_h)*0" in graph
+    assert "adelay=3000:all=1" in graph and "amix=inputs=2:duration=first:normalize=0[a0]" in graph
+
+
+def test_overlay_args_put_inputs_after_main():
+    from simple_montage.model import Overlay
+    ov = Overlay("pip.mp4", 8.0, 640, 360, False, start=0.0, length=2.0)
+    args = build_ffmpeg_args("ffmpeg", info(), [Segment(0, 10)], "out.mp4", overlays=[ov])
+    i = args.index("-i")
+    assert args[i + 1] == "in.mp4" and args[i + 2: i + 8] == ["-ss", "0", "-t", "2", "-i", "pip.mp4"]
+    assert "amix" not in args[args.index("-filter_complex") + 1]

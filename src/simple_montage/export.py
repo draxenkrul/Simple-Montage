@@ -15,10 +15,11 @@ Pure functions only: running the process is the GUI's job.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from simple_montage.model import Segment
+from simple_montage.model import Overlay, Segment
 from simple_montage.probe import MediaInfo
 
 
@@ -92,15 +93,60 @@ def zoom_filter(seg: Segment, info: MediaInfo) -> str:
     return f",{crop},scale={size}:flags=lanczos,setsar={info.sar}"
 
 
-def build_filter_graph(
+def light_filter(seg: Segment) -> str:
+    """FFmpeg ``eq`` filter for the segment's lighting ("" when unchanged)."""
+    if not seg.has_light:
+        return ""
+    return (f",eq=brightness={_num(seg.brightness)}:contrast={_num(seg.contrast)}"
+            f":saturation={_num(seg.saturation)}:gamma={_num(seg.gamma)}")
+
+
+@dataclass
+class _OverlayUse:
+    """One overlay shown during part of one segment."""
+
+    overlay: Overlay
+    input_index: int
+    file_start: float    # where to start reading the overlay file
+    file_length: float   # how much of it to read (source seconds)
+    out_start: float     # when it appears, in the segment's output time
+    out_end: float
+
+
+def _overlay_uses(segments: Sequence[Segment], overlays: Sequence[Overlay],
+                  info: MediaInfo) -> list[list[_OverlayUse]]:
+    """For each segment, the overlays that are visible during it."""
+    min_len = 0.5 / info.fps
+    next_input = 1
+    result: list[list[_OverlayUse]] = []
+    for seg in segments:
+        uses = []
+        for ov in overlays:
+            a, b = max(seg.start, ov.start), min(seg.end, ov.end)
+            if b - a < min_len:
+                continue
+            uses.append(_OverlayUse(
+                ov, next_input,
+                file_start=ov.file_time(a), file_length=b - a,
+                out_start=(a - seg.start) / seg.speed, out_end=(b - seg.start) / seg.speed,
+            ))
+            next_input += 1
+        result.append(uses)
+    return result
+
+
+def build_export(
     segments: Sequence[Segment],
     info: MediaInfo,
     mode: ExportMode = ExportMode.VIDEO_AND_AUDIO,
-) -> str:
-    """Build the ``-filter_complex`` string.
+    overlays: Sequence[Overlay] = (),
+) -> tuple[list[list[str]], str]:
+    """Build the extra FFmpeg inputs and the ``-filter_complex`` string.
 
-    Outputs ``[vout]`` when the mode includes video and ``[aout]`` when it
-    includes audio (and the source has audio).
+    Input 0 is the main video. Every overlay shown during a segment gets its
+    own input, pre-cut with ``-ss``/``-t``, so FFmpeg reads only what is needed.
+    The graph outputs ``[vout]`` when the mode includes video and ``[aout]``
+    when it includes audio (and the source has audio).
     """
     if not segments:
         raise ValueError("Nothing to export: every part of the chosen range is cut out.")
@@ -109,19 +155,51 @@ def build_filter_graph(
     if not want_video and not want_audio:
         raise ValueError("This video has no sound to export.")
 
+    uses_per_segment = _overlay_uses(segments, overlays, info)
+    inputs: list[list[str]] = []
     chains: list[str] = []
     concat_inputs: list[str] = []
-    for i, seg in enumerate(segments):
+    for i, (seg, uses) in enumerate(zip(segments, uses_per_segment)):
+        for use in uses:
+            inputs.append(["-ss", _num(use.file_start), "-t", _num(use.file_length), "-i", use.overlay.path])
         trim = _trim_args(seg, info)
+        tempo = "".join(f",atempo={_num(f)}" for f in atempo_chain(seg.speed))
+        vpts = "PTS-STARTPTS" if seg.speed == 1 else f"(PTS-STARTPTS)/{_num(seg.speed)}"
+
         if want_video:
             trim_v = f"trim={trim}," if trim else ""
-            vpts = "PTS-STARTPTS" if seg.speed == 1 else f"(PTS-STARTPTS)/{_num(seg.speed)}"
-            chains.append(f"[0:v:0]{trim_v}setpts={vpts}{zoom_filter(seg, info)}[v{i}]")
+            label = f"v{i}" if not uses else f"v{i}_0"
+            chains.append(f"[0:v:0]{trim_v}setpts={vpts}{zoom_filter(seg, info)}{light_filter(seg)}[{label}]")
+            for k, use in enumerate(uses):
+                ov, n = use.overlay, use.input_index
+                width = max(2, int(round(info.width * ov.scale / 2)) * 2) if info.width else 2
+                t0, t1 = _num(use.out_start), _num(use.out_end)
+                chains.append(
+                    f"[{n}:v:0]setpts=(PTS-STARTPTS)/{_num(seg.speed)}+{t0}/TB,"
+                    f"scale={width}:-2:flags=lanczos[ov{i}_{k}]"
+                )
+                out = f"v{i}" if k == len(uses) - 1 else f"v{i}_{k + 1}"
+                chains.append(
+                    f"[{label}][ov{i}_{k}]overlay=x=(main_w-overlay_w)*{_num(ov.pos_x)}"
+                    f":y=(main_h-overlay_h)*{_num(ov.pos_y)}:eof_action=pass"
+                    f":enable='between(t,{t0},{t1})'[{out}]"
+                )
+                label = out
             concat_inputs.append(f"[v{i}]")
+
         if want_audio:
             trim_a = f"atrim={trim}," if trim else ""
-            tempo = "".join(f",atempo={_num(f)}" for f in atempo_chain(seg.speed))
-            chains.append(f"[0:a:0]{trim_a}asetpts=PTS-STARTPTS{tempo}[a{i}]")
+            sounding = [u for u in uses if u.overlay.sound and u.overlay.has_audio]
+            label = f"a{i}" if not sounding else f"a{i}_main"
+            chains.append(f"[0:a:0]{trim_a}asetpts=PTS-STARTPTS{tempo}[{label}]")
+            if sounding:
+                mix = [f"[{label}]"]
+                for k, use in enumerate(sounding):
+                    delay = int(round(use.out_start * 1000))
+                    chains.append(f"[{use.input_index}:a:0]asetpts=PTS-STARTPTS{tempo},"
+                                  f"adelay={delay}:all=1[oa{i}_{k}]")
+                    mix.append(f"[oa{i}_{k}]")
+                chains.append(f"{''.join(mix)}amix=inputs={len(mix)}:duration=first:normalize=0[a{i}]")
             concat_inputs.append(f"[a{i}]")
 
     outputs = ("[cv]" if want_video else "") + ("[aout]" if want_audio else "")
@@ -131,7 +209,17 @@ def build_filter_graph(
     )
     if want_video:
         chains.append(f"[cv]fps={info.fps_text},format=yuv420p[vout]")
-    return ";".join(chains)
+    return inputs, ";".join(chains)
+
+
+def build_filter_graph(
+    segments: Sequence[Segment],
+    info: MediaInfo,
+    mode: ExportMode = ExportMode.VIDEO_AND_AUDIO,
+    overlays: Sequence[Overlay] = (),
+) -> str:
+    """Just the ``-filter_complex`` string (see :func:`build_export`)."""
+    return build_export(segments, info, mode, overlays)[1]
 
 
 def build_ffmpeg_args(
@@ -141,6 +229,7 @@ def build_ffmpeg_args(
     output_path: str,
     *,
     mode: ExportMode = ExportMode.VIDEO_AND_AUDIO,
+    overlays: Sequence[Overlay] = (),
     crf: int = 18,
     preset: str = "medium",
 ) -> list[str]:
@@ -149,11 +238,11 @@ def build_ffmpeg_args(
     Video exports are H.264 (+ AAC sound) in MP4. Sound-only exports pick the
     format from the file extension: .mp3, .wav or .m4a.
     """
-    args = [
-        ffmpeg, "-hide_banner", "-y",
-        "-i", info.path,
-        "-filter_complex", build_filter_graph(segments, info, mode),
-    ]
+    inputs, graph = build_export(segments, info, mode, overlays)
+    args = [ffmpeg, "-hide_banner", "-y", "-i", info.path]
+    for extra in inputs:
+        args += extra
+    args += ["-filter_complex", graph]
     if mode == ExportMode.AUDIO_ONLY:
         ext = Path(output_path).suffix.lower()
         args += ["-map", "[aout]", "-vn", *AUDIO_FORMATS.get(ext, AUDIO_FORMATS[".m4a"])]

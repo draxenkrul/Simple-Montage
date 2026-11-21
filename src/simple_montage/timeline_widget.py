@@ -3,11 +3,15 @@
 The horizontal axis is *source* time. Kept segments are drawn as blocks
 (coloured by speed); cut-out parts are hatched.
 
-Mouse: click/drag to seek and select a segment, wheel to zoom,
-Shift+wheel (or horizontal wheel) to scroll.
+Overlay clips (videos shown on top) appear on a lane under the main track.
+
+Mouse: click/drag to seek and select a segment, click an overlay to select it
+and drag it to move it in time, wheel to zoom, Shift+wheel to scroll.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QPainter, QPen, QPolygonF
@@ -29,11 +33,15 @@ COL_SEG_SLOW = QColor("#3dbf8a")
 COL_SELECTED = QColor("#ffffff")
 COL_MARK = QColor("#f2c94c")
 COL_PLAYHEAD = QColor("#ff4d4d")
+COL_OVERLAY = QColor("#9b59d0")
+LANE_H = 24
 
 
 class TimelineWidget(QWidget):
     seek_requested = Signal(float)
     segment_clicked = Signal(int)  # -1 when clicking a cut-out area
+    overlay_clicked = Signal(int)
+    overlay_moved = Signal(int, float)  # index, new start time
 
     def __init__(self, timeline: Timeline, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -42,10 +50,12 @@ class TimelineWidget(QWidget):
         self._mark_in: float | None = None
         self._mark_out: float | None = None
         self._selected = -1
+        self._selected_overlay = -1
+        self._drag_overlay: tuple[int, float] | None = None  # (index, grab offset)
         self._view_start = 0.0
         self._view_len = 0.0  # 0 means "show everything"
         self._dragging = False
-        self.setMinimumHeight(96)
+        self.setMinimumHeight(110)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
     # ------------------------------------------------------------ public API
@@ -68,6 +78,23 @@ class TimelineWidget(QWidget):
     def set_selected(self, index: int) -> None:
         self._selected = index
         self.update()
+
+    def set_selected_overlay(self, index: int) -> None:
+        self._selected_overlay = index
+        self.update()
+
+    # ---------------------------------------------------------------- layout
+    def _main_track(self) -> QRectF:
+        bottom = self.height() - 8 - ((LANE_H + 6) if self._tl.overlays else 0)
+        return QRectF(0, RULER_H + 8, self.width(), bottom - RULER_H - 8)
+
+    def _lane(self) -> QRectF:
+        return QRectF(0, self.height() - 8 - LANE_H, self.width(), LANE_H)
+
+    def _overlay_rect(self, i: int) -> QRectF:
+        ov, lane = self._tl.overlays[i], self._lane()
+        x0, x1 = self._x(ov.start), self._x(ov.end)
+        return QRectF(x0, lane.top(), max(4.0, x1 - x0), lane.height())
 
     # ----------------------------------------------------------- coordinates
     def _x(self, t: float) -> float:
@@ -104,7 +131,7 @@ class TimelineWidget(QWidget):
             self.reset_view()
 
         self._paint_ruler(p, w)
-        track = QRectF(0, RULER_H + 8, w, h - RULER_H - 16)
+        track = self._main_track()
 
         # cut-out background across the whole source
         start_x, end_x = self._x(0), self._x(self._tl.duration)
@@ -128,10 +155,13 @@ class TimelineWidget(QWidget):
                 tags.append(format_speed(seg.speed))
             if seg.zoom > 1:
                 tags.append(f"🔍{format_speed(round(seg.zoom, 2))}")
+            if seg.has_light:
+                tags.append("☀")
             if tags and rect.width() > 30:
                 p.setPen(Qt.GlobalColor.white)
                 p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "  ".join(tags))
 
+        self._paint_overlays(p)
         self._paint_marks(p, track)
 
         x = self._x(self._playhead)
@@ -158,6 +188,19 @@ class TimelineWidget(QWidget):
             p.drawText(int(x) + 3, RULER_H - 8, label)
             t += step
 
+    def _paint_overlays(self, p: QPainter) -> None:
+        for i, ov in enumerate(self._tl.overlays):
+            rect = self._overlay_rect(i)
+            p.setBrush(COL_OVERLAY)
+            selected = i == self._selected_overlay
+            p.setPen(QPen(COL_SELECTED, 2) if selected else QPen(COL_OVERLAY.darker(150), 1))
+            p.drawRoundedRect(rect, 3, 3)
+            if rect.width() > 40:
+                p.setPen(Qt.GlobalColor.white)
+                name = Path(ov.path).name + ("  🔊" if ov.sound else "")
+                text = p.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, int(rect.width()) - 8)
+                p.drawText(rect.adjusted(4, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, text)
+
     def _paint_marks(self, p: QPainter, track: QRectF) -> None:
         if self._mark_in is not None and self._mark_out is not None:
             x0, x1 = self._x(self._mark_in), self._x(self._mark_out)
@@ -174,6 +217,12 @@ class TimelineWidget(QWidget):
     # ----------------------------------------------------------------- mouse
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton and self._tl.duration > 0:
+            pos = event.position()
+            for i in range(len(self._tl.overlays) - 1, -1, -1):  # topmost first
+                if self._overlay_rect(i).contains(pos):
+                    self._drag_overlay = (i, self._t(pos.x()) - self._tl.overlays[i].start)
+                    self.overlay_clicked.emit(i)
+                    return
             self._dragging = True
             t = self._t(event.position().x())
             index = self._tl.index_at(t)
@@ -181,11 +230,15 @@ class TimelineWidget(QWidget):
             self.seek_requested.emit(t)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._dragging:
+        if self._drag_overlay is not None:
+            i, offset = self._drag_overlay
+            self.overlay_moved.emit(i, self._t(event.position().x()) - offset)
+        elif self._dragging:
             self.seek_requested.emit(self._t(event.position().x()))
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
         self._dragging = False
+        self._drag_overlay = None
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         if self._tl.duration <= 0:

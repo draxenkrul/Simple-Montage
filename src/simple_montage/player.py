@@ -9,8 +9,12 @@ from __future__ import annotations
 import math
 import os
 
+from collections.abc import Callable
+
 from PySide6.QtCore import QRect, Qt, Signal
 from PySide6.QtWidgets import QWidget
+
+from simple_montage.model import Overlay
 
 from simple_montage.tools import prepare_mpv_library
 
@@ -47,6 +51,8 @@ class MpvPlayer(QWidget):
         self._mpv = mpv.MPV(**options)
         self._paused = True
         self._view = (1.0, 0.5, 0.5)
+        self._light_filter = ""
+        self.last_position = 0.0
 
         self._mpv.observe_property("time-pos", self._on_time_pos)
         self._mpv.observe_property("pause", self._on_pause)
@@ -55,6 +61,7 @@ class MpvPlayer(QWidget):
     # -------------------------------------------------- mpv thread callbacks
     def _on_time_pos(self, _name: str, value: float | None) -> None:
         if value is not None:
+            self.last_position = float(value)
             self.position_changed.emit(float(value))
 
     def _on_pause(self, _name: str, value: bool | None) -> None:
@@ -95,10 +102,15 @@ class MpvPlayer(QWidget):
 
     def set_volume(self, percent: int) -> None:
         """Preview loudness, 0-100 (does not affect the export)."""
-        self._mpv.volume = max(0, min(100, int(percent)))
+        percent = max(0, min(100, int(percent)))
+        if getattr(self, "_volume", None) != percent:
+            self._volume = percent
+            self._mpv.volume = percent
 
     def set_muted(self, muted: bool) -> None:
-        self._mpv.mute = bool(muted)
+        if getattr(self, "_muted", None) != bool(muted):
+            self._muted = bool(muted)
+            self._mpv.mute = bool(muted)
 
     def set_view(self, zoom: float, pan_x: float, pan_y: float) -> None:
         """Show a zoomed part of the picture, the same area the export will keep.
@@ -117,6 +129,27 @@ class MpvPlayer(QWidget):
         self._mpv.video_pan_x = -(pan_x - 0.5) * shift
         self._mpv.video_pan_y = -(pan_y - 0.5) * shift
 
+    def set_light(self, light: dict[str, float] | None) -> None:
+        """Preview lighting with the same FFmpeg ``eq`` filter the export uses.
+
+        ``None`` (or default values) removes the filter so normal playback
+        costs nothing extra.
+        """
+        spec = ""
+        if light:
+            spec = "eq=" + ":".join(f"{k}={v:.4f}" for k, v in light.items())
+        if spec == self._light_filter:
+            return
+        self._light_filter = spec
+        try:
+            self._mpv.vf = spec
+        except (SystemError, RuntimeError):
+            pass
+
+    @property
+    def speed(self) -> float:
+        return float(self._mpv.speed or 1.0)
+
     def shutdown(self) -> None:
         self._mpv.terminate()
 
@@ -134,6 +167,7 @@ class VideoFrame(QWidget):
         self.player = player
         player.setParent(self)
         self._aspect = 16 / 9
+        self.on_layout: Callable[[], None] | None = None  # called after the player moves
         self.setStyleSheet("background-color: black;")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground)
         self.setMinimumSize(320, 180)
@@ -154,3 +188,82 @@ class VideoFrame(QWidget):
         else:
             pw, ph = w, int(w / self._aspect)
         self.player.setGeometry(QRect((w - pw) // 2, (h - ph) // 2, pw, ph))
+        if self.on_layout:
+            self.on_layout()
+
+
+class OverlayPreview:
+    """Shows an overlay clip on top of the main preview, kept in sync with it.
+
+    Uses a second, small mpv player placed over the main one at the overlay's
+    size and position. It is created the first time an overlay is shown.
+    """
+
+    def __init__(self, frame: VideoFrame, resync: Callable[[], None]) -> None:
+        self.frame = frame
+        self.resync = resync          # asks the window to call update() again
+        self.player: MpvPlayer | None = None
+        self._path: str | None = None
+        self._overlay: Overlay | None = None
+        frame.on_layout = self._place
+
+    def _ensure_player(self) -> MpvPlayer:
+        if self.player is None:
+            self.player = MpvPlayer(self.frame)
+            self.player.set_muted(True)
+            self.player.hide()
+            self.player.file_loaded.connect(self.resync)
+        return self.player
+
+    def _place(self) -> None:
+        ov, p = self._overlay, self.player
+        if ov is None or p is None:
+            return
+        main = self.frame.player.geometry()
+        ow = max(8, int(main.width() * ov.scale))
+        oh = max(8, int(ow / ov.aspect))
+        x = main.x() + int((main.width() - ow) * ov.pos_x)
+        y = main.y() + int((main.height() - oh) * ov.pos_y)
+        p.setGeometry(QRect(x, y, ow, oh))
+
+    def hide(self) -> None:
+        if self.player is not None and self.player.isVisible():
+            self.player.pause()
+            self.player.hide()
+        self._overlay = None
+
+    def update(self, overlay: Overlay | None, t: float, playing: bool, speed: float,
+               volume: int, muted: bool) -> None:
+        """Show ``overlay`` as it looks at main source time ``t`` (or hide)."""
+        if overlay is None or not overlay.active_at(t):
+            self.hide()
+            return
+        p = self._ensure_player()
+        self._overlay = overlay
+        if overlay.path != self._path:
+            self._path = overlay.path
+            p.load(overlay.path)
+            p.last_position = -1.0
+        self._place()
+        if not p.isVisible():
+            p.show()
+            p.raise_()
+        p.set_volume(volume)
+        p.set_muted(muted or not overlay.sound)
+
+        target = overlay.file_time(t)
+        drift = abs(p.last_position - target)
+        if playing:
+            p.set_speed(speed)
+            if p.paused or drift > 0.25:
+                p.seek(target)
+                p.play()
+        else:
+            if not p.paused:
+                p.pause()
+            if drift > 0.02:
+                p.seek(target)
+
+    def shutdown(self) -> None:
+        if self.player is not None:
+            self.player.shutdown()

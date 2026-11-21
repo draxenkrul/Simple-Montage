@@ -144,3 +144,64 @@ def test_zoom_shows_the_chosen_part_of_the_frame(quadrants, tmp_path):
     assert dominant(_average_rgb(out, 1.5)) == "red"
     assert dominant(_average_rgb(out, 2.5)) == "yellow"
     assert dominant(_average_rgb(out, 3.5)) == "blue"
+
+
+def _solid_clip(path, color, size, duration, freq=440):
+    subprocess.run([FFMPEG, "-v", "error", "-y", "-f", "lavfi", "-i", f"color={color}:s={size}:r=25:d={duration}",
+                    "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={duration}",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(path)], check=True)
+    return str(path)
+
+
+def _pixel(path, t, x, y):
+    raw = subprocess.run([FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1",
+                          "-vf", f"crop=8:8:{x}:{y},scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True, check=True).stdout
+    return tuple(raw[:3])
+
+
+def _is(color, rgb):
+    r, g, b = rgb
+    return {"red": r > 180 and g < 80 and b < 80, "blue": b > 180 and r < 80 and g < 80}[color]
+
+
+def test_overlay_follows_cuts_and_speed(tmp_path):
+    from simple_montage.export import ExportMode
+    from simple_montage.model import Overlay
+    main = _solid_clip(tmp_path / "main.mp4", "red", "320x240", 4)
+    pip = _solid_clip(tmp_path / "pip.mp4", "blue", "160x120", 3, freq=880)
+    info, pinfo = probe(FFPROBE, main), probe(FFPROBE, pip)
+    tl = Timeline(info.duration, info.fps)
+    tl.split(2.0)
+    tl.set_speed(1, 2.0)               # main: 0-2 at 1x, 2-4 at 2x -> 3 s output
+    tl.add_overlay(Overlay(pip, pinfo.duration, pinfo.width, pinfo.height, pinfo.has_audio,
+                           start=1.0, length=2.0, scale=0.5, pos_x=1.0, pos_y=1.0, sound=True))
+    out = tmp_path / "out.mp4"
+    args = build_ffmpeg_args(FFMPEG, info, tl.segments, str(out), mode=ExportMode.VIDEO_AND_AUDIO,
+                             overlays=tl.overlays, preset="ultrafast")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+
+    exported = probe(FFPROBE, str(out))
+    assert exported.duration == pytest.approx(3.0, abs=0.1)
+    assert (exported.width, exported.height) == (320, 240)
+    br, tl_ = (300, 220), (10, 10)       # bottom-right (overlay area) and top-left
+    # overlay is shown for main 1-3 s = output 1.0-2.5 s (second half at 2x)
+    assert _is("red", _pixel(out, 0.5, *br))
+    assert _is("blue", _pixel(out, 1.5, *br)) and _is("red", _pixel(out, 1.5, *tl_))
+    assert _is("blue", _pixel(out, 2.2, *br))
+    assert _is("red", _pixel(out, 2.8, *br))
+
+
+def test_lighting_changes_only_its_segment(tmp_path):
+    from simple_montage.export import ExportMode
+    main = _solid_clip(tmp_path / "gray.mp4", "gray", "160x120", 2)
+    info = probe(FFPROBE, main)
+    tl = Timeline(info.duration, info.fps)
+    tl.split(1.0)
+    tl.set_light(1, brightness=0.3)
+    out = tmp_path / "lit.mp4"
+    _export(info, tl.segments, out, ExportMode.VIDEO_ONLY)
+    before, after = _pixel(out, 0.5, 60, 50), _pixel(out, 1.5, 60, 50)
+    assert abs(before[0] - 128) < 15          # untouched
+    assert after[0] > before[0] + 50          # brighter
