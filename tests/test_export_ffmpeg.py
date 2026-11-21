@@ -93,3 +93,54 @@ def test_export_video_without_sound(source, tmp_path):
     out = tmp_path / "silent.mp4"
     _export(info, tl.segments, out, ExportMode.VIDEO_ONLY)
     assert _streams(out) == ["video"]
+
+
+@pytest.fixture(scope="module")
+def quadrants(tmp_path_factory):
+    """4 s clip: red top-left, blue top-right, green bottom-left, yellow bottom-right."""
+    path = tmp_path_factory.mktemp("media") / "quadrants.mp4"
+    colors = ["red", "blue", "green", "yellow"]
+    cmd = [FFMPEG, "-v", "error", "-y"]
+    for c in colors:
+        cmd += ["-f", "lavfi", "-i", f"color={c}:s=160x120:r=25:d=4"]
+    cmd += ["-f", "lavfi", "-i", "sine=duration=4",
+            "-filter_complex", "[0][1]hstack[t];[2][3]hstack[b];[t][b]vstack[v]",
+            "-map", "[v]", "-map", "4:a", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)]
+    subprocess.run(cmd, check=True)
+    return str(path)
+
+
+def _average_rgb(path, t):
+    raw = subprocess.run([FFMPEG, "-v", "error", "-ss", str(t), "-i", str(path), "-frames:v", "1",
+                          "-vf", "scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                         capture_output=True, check=True).stdout
+    return tuple(raw[:3])
+
+
+def test_zoom_shows_the_chosen_part_of_the_frame(quadrants, tmp_path):
+    from simple_montage.export import ExportMode
+    info = probe(FFPROBE, quadrants)
+    tl = Timeline(info.duration, info.fps)
+    for t in (1, 2, 3):
+        tl.split(t)
+    tl.set_zoom(1, 2.0, 0.0, 0.0)   # top-left -> red
+    tl.set_zoom(2, 2.0, 1.0, 1.0)   # bottom-right -> yellow
+    tl.set_zoom(3, 2.0, 1.0, 0.0)   # top-right -> blue
+    out = tmp_path / "zoom.mp4"
+    _export(info, tl.segments, out, ExportMode.VIDEO_AND_AUDIO)
+
+    exported = probe(FFPROBE, str(out))
+    assert (exported.width, exported.height) == (320, 240)
+    assert exported.duration == pytest.approx(4.0, abs=0.1)
+
+    def dominant(rgb):
+        r, g, b = rgb
+        if r > 200 and g > 200 and b < 80:
+            return "yellow"
+        return {0: "red", 1: "green", 2: "blue"}[max(range(3), key=lambda i: rgb[i])]
+
+    mixed = _average_rgb(out, 0.5)          # unzoomed: all four colours averaged
+    assert max(mixed) - min(mixed) < 140
+    assert dominant(_average_rgb(out, 1.5)) == "red"
+    assert dominant(_average_rgb(out, 2.5)) == "yellow"
+    assert dominant(_average_rgb(out, 3.5)) == "blue"

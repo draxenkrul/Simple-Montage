@@ -78,6 +78,20 @@ AUDIO_FORMATS = {  # file extension -> FFmpeg audio encoder arguments
 }
 
 
+def zoom_filter(seg: Segment, info: MediaInfo) -> str:
+    """Crop to the zoomed area and scale back to the source size ("" if not zoomed)."""
+    if seg.zoom <= 1.0 + 1e-9:
+        return ""
+    z = _num(seg.zoom)
+    crop = (
+        f"crop=w=iw/{z}:h=ih/{z}"
+        f":x=(iw-iw/{z})*{_num(seg.pan_x)}:y=(ih-ih/{z})*{_num(seg.pan_y)}"
+    )
+    size = f"{info.width}:{info.height}" if info.width and info.height else f"iw*{z}:ih*{z}"
+    # keep the source pixel aspect so zoomed and normal segments can be joined
+    return f",{crop},scale={size}:flags=lanczos,setsar={info.sar}"
+
+
 def build_filter_graph(
     segments: Sequence[Segment],
     info: MediaInfo,
@@ -102,7 +116,7 @@ def build_filter_graph(
         if want_video:
             trim_v = f"trim={trim}," if trim else ""
             vpts = "PTS-STARTPTS" if seg.speed == 1 else f"(PTS-STARTPTS)/{_num(seg.speed)}"
-            chains.append(f"[0:v:0]{trim_v}setpts={vpts}[v{i}]")
+            chains.append(f"[0:v:0]{trim_v}setpts={vpts}{zoom_filter(seg, info)}[v{i}]")
             concat_inputs.append(f"[v{i}]")
         if want_audio:
             trim_a = f"atrim={trim}," if trim else ""

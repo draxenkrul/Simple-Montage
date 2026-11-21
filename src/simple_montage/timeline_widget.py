@@ -123,9 +123,14 @@ class TimelineWidget(QWidget):
             p.setBrush(color)
             p.setPen(QPen(COL_SELECTED, 2) if i == self._selected else QPen(color.darker(140), 1))
             p.drawRoundedRect(rect, 3, 3)
-            if seg.speed != 1 and rect.width() > 30:
+            tags = []
+            if seg.speed != 1:
+                tags.append(format_speed(seg.speed))
+            if seg.zoom > 1:
+                tags.append(f"🔍{format_speed(round(seg.zoom, 2))}")
+            if tags and rect.width() > 30:
                 p.setPen(Qt.GlobalColor.white)
-                p.drawText(rect, Qt.AlignmentFlag.AlignCenter, format_speed(seg.speed))
+                p.drawText(rect, Qt.AlignmentFlag.AlignCenter, "  ".join(tags))
 
         self._paint_marks(p, track)
 

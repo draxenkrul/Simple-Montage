@@ -11,19 +11,29 @@ from __future__ import annotations
 
 import copy
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 MIN_SPEED = 0.1
 MAX_SPEED = 10.0
+MIN_ZOOM = 1.0
+MAX_ZOOM = 5.0
 
 
 @dataclass
 class Segment:
-    """A kept piece of the source video, ``[start, end)`` in source seconds."""
+    """A kept piece of the source video, ``[start, end)`` in source seconds.
+
+    ``zoom`` magnifies the picture (1 = whole frame, 2 = half the width and
+    height, ...). ``pan_x``/``pan_y`` choose which part is shown when zoomed:
+    0 = left/top edge, 0.5 = centre, 1 = right/bottom edge.
+    """
 
     start: float
     end: float
     speed: float = 1.0
+    zoom: float = 1.0
+    pan_x: float = 0.5
+    pan_y: float = 0.5
 
     @property
     def source_duration(self) -> float:
@@ -118,7 +128,7 @@ class Timeline:
         for seg in self.segments:
             start, end = max(seg.start, a), min(seg.end, b)
             if end - start >= min_len:
-                result.append(Segment(start, end, seg.speed))
+                result.append(replace(seg, start=start, end=end))
         return result
 
     # ---------------------------------------------------------------- editing
@@ -134,8 +144,8 @@ class Timeline:
             return False
         self._checkpoint()
         self.segments[i : i + 1] = [
-            Segment(seg.start, t, seg.speed),
-            Segment(t, seg.end, seg.speed),
+            replace(seg, end=t),
+            replace(seg, start=t),
         ]
         return True
 
@@ -183,6 +193,25 @@ class Timeline:
         self.segments[index].speed = speed
         return True
 
+    def set_zoom(self, index: int, zoom: float, pan_x: float | None = None,
+                 pan_y: float | None = None) -> bool:
+        """Change one segment's zoom and/or visible area.
+
+        Repeated changes (dragging, spinning) merge into one undo step.
+        """
+        if not 0 <= index < len(self.segments):
+            return False
+        seg = self.segments[index]
+        zoom = min(max(float(zoom), MIN_ZOOM), MAX_ZOOM)
+        pan_x = seg.pan_x if pan_x is None else min(max(float(pan_x), 0.0), 1.0)
+        pan_y = seg.pan_y if pan_y is None else min(max(float(pan_y), 0.0), 1.0)
+        if (abs(seg.zoom - zoom) < 1e-9 and abs(seg.pan_x - pan_x) < 1e-9
+                and abs(seg.pan_y - pan_y) < 1e-9):
+            return False
+        self._checkpoint(op=("zoom", index))
+        seg.zoom, seg.pan_x, seg.pan_y = zoom, pan_x, pan_y
+        return True
+
     def _without_range(self, segments: list[Segment], a: float, b: float) -> list[Segment]:
         min_len = self.frame_duration * 0.5
         result: list[Segment] = []
@@ -191,9 +220,9 @@ class Timeline:
                 result.append(copy.copy(seg))
                 continue
             if a - seg.start >= min_len:
-                result.append(Segment(seg.start, a, seg.speed))
+                result.append(replace(seg, end=a))
             if seg.end - b >= min_len:
-                result.append(Segment(b, seg.end, seg.speed))
+                result.append(replace(seg, start=b))
         return result
 
     # ------------------------------------------------------------- undo/redo

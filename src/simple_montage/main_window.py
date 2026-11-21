@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from fractions import Fraction
 from pathlib import Path
 
 from PySide6.QtCore import QSettings, Qt
@@ -27,17 +28,19 @@ from PySide6.QtWidgets import (
 from simple_montage.export import AUDIO_FORMATS, ExportMode, build_ffmpeg_args
 from simple_montage.export_dialog import ExportDialog
 from simple_montage.export_runner import ExportRunner
-from simple_montage.model import MAX_SPEED, MIN_SPEED, Timeline
-from simple_montage.player import MpvPlayer
+from simple_montage.model import MAX_SPEED, MAX_ZOOM, MIN_SPEED, MIN_ZOOM, Timeline
+from simple_montage.player import MpvPlayer, VideoFrame
 from simple_montage.probe import MediaInfo, ProbeError, probe
 from simple_montage.timecode import format_speed, format_time
 from simple_montage.timeline_widget import TimelineWidget
 from simple_montage.tools import find_ffmpeg, find_ffprobe
+from simple_montage.zoom_navigator import ZoomNavigator
 
 VIDEO_FILTER = "Videos (*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.mts *.m2ts *.wmv *.flv);;All files (*)"
 PLAYBACK_RATES = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0]
 SPEED_PRESETS = [0.25, 0.5, 1.0, 2.0, 4.0]
 VOLUME_STEP = 5
+ZOOM_PRESETS = [1.0, 1.5, 2.0, 3.0]
 
 
 class MainWindow(QMainWindow):
@@ -59,6 +62,7 @@ class MainWindow(QMainWindow):
         self._export: ExportRunner | None = None
 
         self.player = MpvPlayer()
+        self.video_frame = VideoFrame(self.player)
         self.timeline_view = TimelineWidget(self.timeline)
 
         self._build_actions()
@@ -186,6 +190,21 @@ class MainWindow(QMainWindow):
             for s in SPEED_PRESETS
         ]
 
+        self.zoom_spin = QDoubleSpinBox()
+        self.zoom_spin.setRange(MIN_ZOOM, MAX_ZOOM)
+        self.zoom_spin.setSingleStep(0.1)
+        self.zoom_spin.setDecimals(2)
+        self.zoom_spin.setSuffix("×")
+        self.zoom_spin.setToolTip("Zoom of the selected segment (1× = whole picture)")
+        self.zoom_spin.setKeyboardTracking(False)
+        self.zoom_buttons = [
+            self._button(format_speed(z), f"Zoom the selected segment to {format_speed(z)}",
+                         lambda _=False, z=z: self.set_segment_zoom(z))
+            for z in ZOOM_PRESETS
+        ]
+        self.btn_center = self._button("Center", "Show the middle of the picture", lambda: self.set_segment_pan(0.5, 0.5))
+        self.navigator = ZoomNavigator()
+
         edit_row = QHBoxLayout()
         for w in (self.btn_split, self.btn_delete, self.btn_in, self.btn_out,
                   self.btn_cut_range, self.btn_keep_range):
@@ -200,13 +219,26 @@ class MainWindow(QMainWindow):
         for b in self.preset_buttons:
             segment_row.addWidget(b)
 
+        zoom_row = QHBoxLayout()
+        zoom_hint = QLabel("Zoom: pick a level, then drag the box on the right to choose the visible area →")
+        zoom_hint.setStyleSheet("color: gray;")
+        zoom_row.addWidget(zoom_hint)
+        zoom_row.addStretch()
+        zoom_row.addWidget(QLabel("Segment zoom:"))
+        zoom_row.addWidget(self.zoom_spin)
+        for b in self.zoom_buttons:
+            zoom_row.addWidget(b)
+        zoom_row.addWidget(self.btn_center)
+        zoom_row.addWidget(self.navigator)
+
         central = QWidget()
         layout = QVBoxLayout(central)
-        layout.addWidget(self.player, stretch=1)
+        layout.addWidget(self.video_frame, stretch=1)
         layout.addLayout(transport)
         layout.addWidget(self.timeline_view)
         layout.addLayout(edit_row)
         layout.addLayout(segment_row)
+        layout.addLayout(zoom_row)
         self.setCentralWidget(central)
 
         self.output_label = QLabel()
@@ -219,9 +251,11 @@ class MainWindow(QMainWindow):
         self.timeline_view.seek_requested.connect(self.seek)
         self.timeline_view.segment_clicked.connect(self.select)
         self.rate_combo.currentIndexChanged.connect(self._on_rate_changed)
-        self.preview_edits.toggled.connect(lambda _: self._update_player_speed())
+        self.preview_edits.toggled.connect(lambda _: (self._update_player_speed(), self._update_player_view()))
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
         self.speed_spin.valueChanged.connect(self.set_segment_speed)
+        self.zoom_spin.valueChanged.connect(self.set_segment_zoom)
+        self.navigator.view_changed.connect(self.set_segment_pan)
 
     # ================================================================== files
     def open_dialog(self) -> None:
@@ -246,6 +280,10 @@ class MainWindow(QMainWindow):
         self.mark_in = self.mark_out = None
         self.selected = -1
         self.timeline_view.reset_view()
+        aspect = info.width * float(Fraction(info.sar)) / info.height if info.height else 16 / 9
+        self.video_frame.set_aspect(aspect)
+        self.navigator.set_aspect(aspect)
+        self.player.set_view(1.0, 0.5, 0.5)
         self.player.load(path)
         self.setWindowTitle(f"{Path(path).name} — Simple Montage")
         fps = f"{info.fps:.3f}".rstrip("0").rstrip(".")
@@ -373,6 +411,16 @@ class MainWindow(QMainWindow):
                 speed *= self.timeline.segments[i].speed
         self.player.set_speed(speed)
 
+    def _update_player_view(self, t: float | None = None) -> None:
+        """Preview the zoom of the segment under the playhead."""
+        t = self.position if t is None else t
+        i = self.timeline.index_at(t) if self.preview_edits.isChecked() else None
+        if i is None:
+            self.player.set_view(1.0, 0.5, 0.5)
+        else:
+            seg = self.timeline.segments[i]
+            self.player.set_view(seg.zoom, seg.pan_x, seg.pan_y)
+
     def _on_pause_changed(self, paused: bool) -> None:
         self.btn_play.setText("▶" if paused else "⏸")
 
@@ -380,6 +428,7 @@ class MainWindow(QMainWindow):
         self.position = t
         self.timeline_view.set_playhead(t)
         self._update_time_label()
+        self._update_player_view(t)
         if not self.player.paused and self.preview_edits.isChecked():
             self._follow_edit(t)
 
@@ -494,14 +543,36 @@ class MainWindow(QMainWindow):
             self._update_player_speed()
             self._refresh()
 
+    def _show_selected(self) -> None:
+        """Move the playhead into the selected segment so its zoom is visible."""
+        seg = self.timeline.segments[self.selected]
+        if not seg.contains(self.position):
+            self.seek(seg.start)
+
+    def set_segment_zoom(self, zoom: float) -> None:
+        if self.timeline.set_zoom(self.selected, zoom):
+            self._show_selected()
+            self._update_player_view()
+            self._refresh()
+
+    def set_segment_pan(self, pan_x: float, pan_y: float) -> None:
+        if 0 <= self.selected < len(self.timeline.segments):
+            seg = self.timeline.segments[self.selected]
+            if self.timeline.set_zoom(self.selected, seg.zoom, pan_x, pan_y):
+                self._show_selected()
+                self._update_player_view()
+                self._refresh()
+
     def undo(self) -> None:
         if self.timeline.undo():
             self.selected = -1
+            self._update_player_view()
             self._refresh()
 
     def redo(self) -> None:
         if self.timeline.redo():
             self.selected = -1
+            self._update_player_view()
             self._refresh()
 
     # ================================================================ display
@@ -536,9 +607,9 @@ class MainWindow(QMainWindow):
         self.btn_delete.setEnabled(has_sel)
         self.btn_cut_range.setEnabled(has_marks)
         self.btn_keep_range.setEnabled(has_marks)
-        self.speed_spin.setEnabled(has_sel)
-        for b in self.preset_buttons:
-            b.setEnabled(has_sel)
+        for w in (self.speed_spin, self.zoom_spin, self.navigator, *self.preset_buttons, *self.zoom_buttons):
+            w.setEnabled(has_sel)
+        self.btn_center.setEnabled(has_sel and tl.segments[self.selected].zoom > 1)
 
         if has_sel:
             seg = tl.segments[self.selected]
@@ -546,10 +617,13 @@ class MainWindow(QMainWindow):
                 f"Segment {self.selected + 1}/{len(tl.segments)}: "
                 f"{format_time(seg.start)} – {format_time(seg.end)}  →  {format_time(seg.output_duration)} long"
             )
-            self.speed_spin.blockSignals(True)
-            self.speed_spin.setValue(seg.speed)
-            self.speed_spin.blockSignals(False)
+            for spin, value in ((self.speed_spin, seg.speed), (self.zoom_spin, seg.zoom)):
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+            self.navigator.set_view(seg.zoom, seg.pan_x, seg.pan_y)
         else:
+            self.navigator.set_view(1.0, 0.5, 0.5)
             self.segment_label.setText("Click a segment on the timeline to select it" if loaded else "")
 
         if loaded:

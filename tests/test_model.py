@@ -110,3 +110,23 @@ def test_segments_between_cut_out_range_is_empty():
     tl = Timeline(20.0, 25)
     tl.delete_range(5, 10)
     assert tl.segments_between(6, 9) == []
+
+
+def test_zoom_is_kept_by_split_delete_and_ranges():
+    tl = Timeline(10.0, 25)
+    tl.set_zoom(0, 2.0, 0.0, 1.0)
+    tl.split(5.0)
+    tl.delete_range(7, 8)
+    for seg in tl.segments + tl.segments_between(2, 9):
+        assert (seg.zoom, seg.pan_x, seg.pan_y) == (2.0, 0.0, 1.0)
+
+
+def test_zoom_is_clamped_and_merges_into_one_undo_step():
+    from simple_montage.model import MAX_ZOOM
+    tl = Timeline(10.0, 25)
+    tl.set_zoom(0, 50, 7, -3)
+    assert (tl.segments[0].zoom, tl.segments[0].pan_x, tl.segments[0].pan_y) == (MAX_ZOOM, 1.0, 0.0)
+    tl.set_zoom(0, 2.0, 0.3)   # pan_y unchanged when not given
+    assert tl.segments[0].pan_y == 0.0
+    tl.undo()
+    assert tl.segments[0].zoom == 1.0 and tl.segments[0].pan_x == 0.5

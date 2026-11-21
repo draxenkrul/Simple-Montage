@@ -36,3 +36,11 @@ def test_format_time():
     assert format_time(3723.4567) == "1:02:03.457"
     assert format_time(59.9996, millis=False) == "0:01:00"
     assert format_speed(2.0) == "2×" and format_speed(0.25) == "0.25×"
+
+
+def test_parse_sample_aspect_ratio():
+    base = {"codec_type": "video", "avg_frame_rate": "25/1"}
+    fmt = {"duration": "3"}
+    assert parse_ffprobe_json("a", {"streams": [dict(base, sample_aspect_ratio="4:3")], "format": fmt}).sar == "4/3"
+    assert parse_ffprobe_json("a", {"streams": [dict(base, sample_aspect_ratio="0:1")], "format": fmt}).sar == "1/1"
+    assert parse_ffprobe_json("a", {"streams": [base], "format": fmt}).sar == "1/1"

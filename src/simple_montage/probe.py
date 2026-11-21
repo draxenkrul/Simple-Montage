@@ -21,6 +21,7 @@ class MediaInfo:
     width: int
     height: int
     has_audio: bool
+    sar: str = "1"  # pixel (sample) aspect ratio, e.g. "1" or "4/3"
 
 
 def _parse_rate(text: str | None) -> Fraction | None:
@@ -52,6 +53,11 @@ def parse_ffprobe_json(path: str, data: dict) -> MediaInfo:
     except (TypeError, ValueError):
         raise ProbeError("Could not read the video duration.") from None
 
+    sar = Fraction(1)
+    num, _, den = str(video.get("sample_aspect_ratio") or "").partition(":")
+    if num.isdigit() and den.isdigit() and int(num) > 0 and int(den) > 0:
+        sar = Fraction(int(num), int(den))
+
     return MediaInfo(
         path=path,
         duration=duration,
@@ -60,6 +66,7 @@ def parse_ffprobe_json(path: str, data: dict) -> MediaInfo:
         width=int(video.get("width") or 0),
         height=int(video.get("height") or 0),
         has_audio=has_audio,
+        sar=f"{sar.numerator}/{sar.denominator}",
     )
 
 

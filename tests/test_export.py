@@ -93,3 +93,14 @@ def test_audio_only_args_pick_codec_from_extension(ext, codec):
     from simple_montage.export import ExportMode
     args = build_ffmpeg_args("ffmpeg", info(), [Segment(0, 10)], "out" + ext, mode=ExportMode.AUDIO_ONLY)
     assert codec in args and "-vn" in args and "libx264" not in args and "[vout]" not in args
+
+
+def test_zoom_filter():
+    seg = Segment(0, 10, 1.0, zoom=2.0, pan_x=0.25, pan_y=1.0)
+    graph = build_filter_graph([seg], info())
+    assert ("setpts=PTS-STARTPTS,crop=w=iw/2:h=ih/2:x=(iw-iw/2)*0.25:y=(ih-ih/2)*1,"
+            "scale=1920:1080:flags=lanczos,setsar=1[v0]") in graph
+
+
+def test_no_zoom_filter_at_1x():
+    assert "crop" not in build_filter_graph([Segment(0, 10)], info())

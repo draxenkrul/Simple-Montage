@@ -6,6 +6,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 
 - Split the video at the playhead, delete parts, or cut/keep an In→Out range
 - Give every segment its own speed (0.1× – 10×), audio keeps its pitch
+- Zoom into the picture per segment (1× – 5×) and choose which part is shown
 - Frame-exact preview with frame stepping; playback can preview the edit (skips cuts, applies speeds)
 - Export the whole timeline or only part of it (e.g. second 5 to 10)
 - Export video with sound, video without sound, or **sound only** (MP3 / WAV / M4A)
@@ -128,6 +129,19 @@ Click a block to select it, then delete it or change its speed.
 | Ctrl+O / Ctrl+E | Open / export |
 | Mouse wheel on timeline | Zoom (Shift+wheel scrolls) |
 
+## Zooming
+
+Every segment can be zoomed into, just like it can have its own speed:
+
+1. Select a segment on the timeline (to zoom the whole video, don't split it — it is one segment).
+2. Set **Segment zoom** (e.g. click **2×**, or type any value from 1× to 5×).
+3. Drag the box in the small frame map on the right to choose **which part** of the picture
+   is shown. Double-click the map or press **Center** to go back to the middle.
+
+The preview shows the zoom immediately (with *Preview edits* ticked), and the export keeps
+exactly that area, scaled back up to the original resolution. To zoom only one moment, split
+the video around it (**S**) and zoom just that segment. Zoomed segments show 🔍 on the timeline.
+
 ## Exporting
 
 **File → Export…** (Ctrl+E) opens the export window:
@@ -164,6 +178,7 @@ src/simple_montage/
   player.py           libmpv preview widget
   timeline_widget.py  custom-painted timeline
   export_dialog.py    export window (range, video/sound)
+  zoom_navigator.py   frame map for choosing the zoomed area
   model.py            edit model (segments, speeds, undo/redo) — no GUI code
   export.py           builds the FFmpeg command — no GUI code
   export_runner.py    runs FFmpeg in the background with progress
