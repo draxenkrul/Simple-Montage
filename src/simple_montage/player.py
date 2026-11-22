@@ -75,17 +75,18 @@ class MpvPlayer(QWidget):
         self._light_filter = ""
         self._mpv.loadfile(path)
 
-    def load_clips(self, clips: list[tuple[str, float]]) -> None:
-        """Play several files back to back as one timeline.
+    def load_clips(self, clips: list[tuple[str, float, float]]) -> None:
+        """Play pieces of files back to back as one timeline.
 
-        ``clips`` are ``(path, duration)`` pairs. Uses mpv's EDL playlist so
-        seeking and playback run seamlessly across clips; the durations are
-        given explicitly so mpv's timeline matches ours exactly.
+        ``clips`` are ``(path, start_in_file, length)``. Uses mpv's EDL
+        playlist so seeking and playback run seamlessly across pieces; the
+        times are given explicitly so mpv's timeline matches ours exactly.
         """
-        if len(clips) == 1:
+        if len(clips) == 1 and clips[0][1] < 1e-6:
             self.load(clips[0][0])
             return
-        parts = [f"%{len(path.encode('utf-8'))}%{path},0,{duration:.6f}" for path, duration in clips]
+        parts = [f"%{len(path.encode('utf-8'))}%{path},{start:.6f},{length:.6f}"
+                 for path, start, length in clips]
         self.load("edl://" + ";".join(parts))
 
     @property
@@ -264,6 +265,7 @@ class OverlayPreview:
             p.raise_()
         p.set_volume(volume)
         p.set_muted(muted or not overlay.sound)
+        p.set_view(overlay.zoom, overlay.pan_x, overlay.pan_y)
 
         target = overlay.file_time(t)
         drift = abs(p.last_position - target)

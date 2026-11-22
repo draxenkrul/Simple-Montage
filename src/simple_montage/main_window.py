@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QTabWidget,
     QVBoxLayout,
@@ -108,6 +109,10 @@ class MainWindow(QMainWindow):
         self.act_redo = self._action("&Redo", ["Ctrl+Y", "Ctrl+Shift+Z"], self.redo, m_edit)
         m_edit.addSeparator()
         self.act_split = self._action("&Split at playhead", "S", self.split, m_edit)
+        self.act_move_earlier = self._action("Move segment &earlier", "Ctrl+Left",
+                                             lambda: self.move_selected_segment(-1), m_edit)
+        self.act_move_later = self._action("Move segment &later", "Ctrl+Right",
+                                           lambda: self.move_selected_segment(1), m_edit)
         self.act_delete = self._action("&Delete selected segment / overlay", [QKeySequence.StandardKey.Delete, "Backspace"],
                                        self.delete_selected, m_edit)
         m_edit.addSeparator()
@@ -183,15 +188,21 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.preview_edits)
 
         # edit row
-        self.btn_split = self._button("✂ Split (S)", "Split the segment at the playhead", self.split)
-        self.btn_delete = self._button("🗑 Delete (Del)", "Cut out the selected segment", self.delete_selected)
-        self.btn_in = self._button("[ In (I)", "Set In mark at the playhead", self.set_in)
-        self.btn_out = self._button("Out (O) ]", "Set Out mark at the playhead", self.set_out)
-        self.btn_cut_range = self._button("Cut In→Out (X)", "Remove everything between the marks", self.cut_range)
-        self.btn_keep_range = self._button("Keep In→Out (K)", "Remove everything outside the marks", self.keep_range)
+        self.btn_split = self._button("✂ Split", "Split the segment at the playhead (S)", self.split)
+        self.btn_delete = self._button("🗑 Delete", "Cut out the selected segment (Del)", self.delete_selected)
+        self.btn_in = self._button("[ In", "Set In mark at the playhead (I)", self.set_in)
+        self.btn_out = self._button("Out ]", "Set Out mark at the playhead (O)", self.set_out)
+        self.btn_cut_range = self._button("Cut In→Out", "Remove everything between the marks (X)", self.cut_range)
+        self.btn_keep_range = self._button("Keep In→Out", "Remove everything outside the marks (K)", self.keep_range)
+        self.btn_move_earlier = self._button("◀ Move", "Move the selected segment earlier (Ctrl+←)\n"
+                                             "Or drag a segment sideways on the timeline.",
+                                             lambda: self.move_selected_segment(-1))
+        self.btn_move_later = self._button("Move ▶", "Move the selected segment later (Ctrl+→)\n"
+                                           "Or drag a segment sideways on the timeline.",
+                                           lambda: self.move_selected_segment(1))
         self.btn_add_clip = self._button("➕ Add video", "Add another video to the end of the timeline (Ctrl+Shift+A)",
                                          self.add_clip_dialog)
-        self.btn_export_segment = self._button("⬇ Export segment", "Export the selected segment to a file (Ctrl+Shift+E)",
+        self.btn_export_segment = self._button("⬇ Export", "Export the selected segment to a file (Ctrl+Shift+E)",
                                                lambda: self.export_segment())
 
         self.segment_label = QLabel()
@@ -224,11 +235,11 @@ class MainWindow(QMainWindow):
         self.navigator = ZoomNavigator()
 
         edit_row = QHBoxLayout()
-        for w in (self.btn_split, self.btn_delete, self.btn_in, self.btn_out,
+        for w in (self.btn_split, self.btn_delete, self.btn_move_earlier, self.btn_move_later,
+                  self.btn_in, self.btn_out,
                   self.btn_cut_range, self.btn_keep_range, self.btn_add_clip, self.btn_export_segment):
             edit_row.addWidget(w)
         edit_row.addStretch()
-        edit_row.addWidget(self.segment_label)
 
         segment_row = QHBoxLayout()
         segment_row.addStretch()
@@ -240,6 +251,7 @@ class MainWindow(QMainWindow):
         zoom_row = QHBoxLayout()
         zoom_hint = QLabel("Zoom: pick a level, then drag the box on the right to choose the visible area →")
         zoom_hint.setStyleSheet("color: gray;")
+        zoom_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)  # one line, may be cut
         zoom_row.addWidget(zoom_hint)
         zoom_row.addStretch()
         zoom_row.addWidget(QLabel("Segment zoom:"))
@@ -260,6 +272,17 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(speed_zoom_page, "⏩ Speed && Zoom")
         self.tabs.addTab(self.light_panel, "☀ Light")
         self.tabs.addTab(self.overlay_panel, "🖼 Overlay video")
+        # what is selected, shown right of the tabs; may shrink (elided) on narrow windows
+        self.segment_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.segment_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.segment_label.setMinimumWidth(0)
+        corner = QWidget()
+        corner_layout = QHBoxLayout(corner)
+        corner_layout.setContentsMargins(12, 0, 4, 0)
+        corner_layout.addWidget(self.segment_label)
+        corner.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        corner.setMinimumWidth(0)
+        self.tabs.setCornerWidget(corner, Qt.Corner.TopRightCorner)
 
         central = QWidget()
         layout = QVBoxLayout(central)
@@ -284,6 +307,7 @@ class MainWindow(QMainWindow):
         self.timeline_view.export_all_requested.connect(self.export_all_segments)
         self.timeline_view.export_cut_requested.connect(self.export_cut_part)
         self.timeline_view.add_clip_requested.connect(self.add_clip_dialog)
+        self.timeline_view.segment_move_requested.connect(self.move_segment)
         self.timeline_view.move_clip_requested.connect(self.move_clip)
         self.timeline_view.remove_clip_requested.connect(self.remove_clip)
         self.timeline_view.overlay_moved.connect(lambda i, t: self.change_overlay({"start": t}))
@@ -365,7 +389,7 @@ class MainWindow(QMainWindow):
     # ========================================================== combining clips
     @property
     def any_audio(self) -> bool:
-        return any(src.has_audio for src in self.timeline.sources)
+        return any(src.has_audio for src in self.timeline.clips)
 
     def add_clip_dialog(self) -> None:
         if not self.info:
@@ -388,6 +412,19 @@ class MainWindow(QMainWindow):
         self.selected = -1 if index is None else index
         self._refresh()
 
+    def move_selected_segment(self, step: int) -> None:
+        if self.selected >= 0:
+            self.move_segment(self.selected, self.selected + step)
+
+    def move_segment(self, index: int, target: int) -> None:
+        """Change the order of segments; the moved one stays selected."""
+        new = self.timeline.move_segment_to(index, target)
+        if new is None:
+            return
+        self.selected, self.selected_overlay = new, -1
+        self._reload_clips(self.timeline.segments[new].start)
+        self._refresh()
+
     def move_clip(self, k: int, step: int) -> None:
         if self.timeline.move_clip(k, step):
             self.selected = self.selected_overlay = -1
@@ -402,14 +439,14 @@ class MainWindow(QMainWindow):
 
     def _apply_first_clip(self) -> None:
         """The first clip sets the output size, so the preview takes its shape."""
-        info = self.info = self.timeline.sources[0]
+        info = self.info = self.timeline.clips[0].media
         aspect = info.width * float(Fraction(info.sar)) / info.height if info.height else 16 / 9
         self.aspect = aspect
         self.video_frame.set_aspect(aspect)
         self.navigator.set_aspect(aspect)
 
-    def _clip_list(self) -> list[tuple[str, float]]:
-        return [(src.path, src.duration) for src in self.timeline.sources]
+    def _clip_list(self) -> list[tuple[str, float, float]]:
+        return [(c.path, c.in_point, c.length) for c in self.timeline.clips]
 
     def _reload_clips(self, seek_to: float) -> None:
         """Reload the preview after the list of clips changed."""
@@ -420,18 +457,18 @@ class MainWindow(QMainWindow):
         self._apply_first_clip()
         self.player.load_clips(self._clip_list())
         self._update_title()
-        if len(self.timeline.sources) > 1:
-            first = self.timeline.sources[0]
+        if len(self.timeline.clips) > 1:
+            first = self.timeline.clips[0]
             self.statusBar().showMessage(
-                f"{len(self.timeline.sources)} clips · {format_time(self.timeline.duration)} in total · "
+                f"{len(self.timeline.clips)} clips · {format_time(self.timeline.duration)} in total · "
                 f"output {first.width}×{first.height} (set by the first clip)")
 
     def _update_title(self) -> None:
-        if not self.timeline.sources:
+        if not self.timeline.clips:
             self.setWindowTitle("Simple Montage")
             return
-        first = Path(self.timeline.sources[0].path).name
-        more = len(self.timeline.sources) - 1
+        first = Path(self.timeline.clips[0].path).name
+        more = len(self.timeline.clips) - 1
         self.setWindowTitle(f"{first}{f' + {more} more' if more else ''} — Simple Montage")
 
     # ================================================================ export
@@ -463,7 +500,7 @@ class MainWindow(QMainWindow):
             out += "." + chosen_filter.split("*.")[-1].rstrip(")")
         if not self._export_target_ok(out, opts.mode):
             return
-        args = build_ffmpeg_args(ffmpeg, self.timeline.sources, opts.segments, out, mode=opts.mode,
+        args = build_ffmpeg_args(ffmpeg, self.timeline.clips, opts.segments, out, mode=opts.mode,
                                  overlays=self.timeline.overlays)
         self._run_exports([(args, sum(seg.output_duration for seg in opts.segments), out)])
 
@@ -505,7 +542,7 @@ class MainWindow(QMainWindow):
         mode = ExportMode.AUDIO_ONLY if ext in AUDIO_FORMATS else ExportMode.VIDEO_AND_AUDIO
         if not self._export_target_ok(out, mode):
             return
-        args = build_ffmpeg_args(ffmpeg, self.timeline.sources, segments, out, mode=mode, overlays=overlays)
+        args = build_ffmpeg_args(ffmpeg, self.timeline.clips, segments, out, mode=mode, overlays=overlays)
         self._run_exports([(args, sum(s.output_duration for s in segments), out)])
 
     def export_all_segments(self) -> None:
@@ -540,7 +577,7 @@ class MainWindow(QMainWindow):
             return
         jobs = []
         for seg, out in zip(self.timeline.segments, outs):
-            args = build_ffmpeg_args(ffmpeg, self.timeline.sources, [seg], out, mode=mode, overlays=self.timeline.overlays)
+            args = build_ffmpeg_args(ffmpeg, self.timeline.clips, [seg], out, mode=mode, overlays=self.timeline.overlays)
             jobs.append((args, seg.output_duration, out))
         self._run_exports(jobs, folder=folder)
 
@@ -551,7 +588,7 @@ class MainWindow(QMainWindow):
         return ffmpeg
 
     def _export_target_ok(self, out: str, mode: ExportMode) -> bool:
-        if any(os.path.abspath(out) == os.path.abspath(src.path) for src in self.timeline.sources):
+        if any(os.path.abspath(out) == os.path.abspath(src.path) for src in self.timeline.clips):
             QMessageBox.warning(self, "Export", "Choose a different file than the source video.")
             return False
         if mode == ExportMode.AUDIO_ONLY and not self.any_audio:
@@ -940,6 +977,10 @@ class MainWindow(QMainWindow):
         self.act_redo.setEnabled(tl.can_redo)
         self.btn_delete.setEnabled(has_sel or self.selected_overlay >= 0)
         self.btn_export_segment.setEnabled(has_sel)
+        can_earlier, can_later = has_sel and self.selected > 0, has_sel and self.selected < len(tl.segments) - 1
+        for w, ok in ((self.btn_move_earlier, can_earlier), (self.act_move_earlier, can_earlier),
+                      (self.btn_move_later, can_later), (self.act_move_later, can_later)):
+            w.setEnabled(ok)
         self.act_export_segment.setEnabled(has_sel)
         self.act_export_all.setEnabled(loaded and len(tl.segments) > 1)
         self.btn_cut_range.setEnabled(has_marks)

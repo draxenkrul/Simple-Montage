@@ -220,7 +220,7 @@ def test_combine_clips_of_different_size_and_sound(tmp_path):
     tl.split(3.5)
     tl.set_speed(tl.index_at(4.0), 2.0)         # second half of blue at 2x
     out = tmp_path / "combined.mp4"
-    args = build_ffmpeg_args(FFMPEG, tl.sources, tl.segments, str(out), mode=ExportMode.VIDEO_AND_AUDIO,
+    args = build_ffmpeg_args(FFMPEG, tl.clips, tl.segments, str(out), mode=ExportMode.VIDEO_AND_AUDIO,
                              preset="ultrafast")
     result = subprocess.run(args, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[-3000:]
@@ -232,3 +232,31 @@ def test_combine_clips_of_different_size_and_sound(tmp_path):
     assert _is("red", _pixel(out, 1.0, 150, 110))
     assert _is("blue", _pixel(out, 2.3, 150, 110))       # blue, letterboxed
     assert sum(_pixel(out, 2.3, 150, 10)) < 60            # black bar above it
+
+
+def test_reordered_segments_export_in_new_order(tmp_path):
+    from simple_montage.export import ExportMode
+    path = tmp_path / "rgb.mp4"                  # red 0-1 s, green 1-2 s, blue 2-3 s
+    subprocess.run([FFMPEG, "-v", "error", "-y",
+                    "-f", "lavfi", "-i", "color=red:s=160x120:r=25:d=1",
+                    "-f", "lavfi", "-i", "color=green:s=160x120:r=25:d=1",
+                    "-f", "lavfi", "-i", "color=blue:s=160x120:r=25:d=1",
+                    "-f", "lavfi", "-i", "sine=duration=3",
+                    "-filter_complex", "[0][1][2]concat=n=3:v=1:a=0[v]", "-map", "[v]", "-map", "3:a",
+                    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(path)], check=True)
+    info = probe(FFPROBE, str(path))
+    tl = Timeline.from_media(info)
+    tl.delete_range(1.0, 2.0)                    # remove green
+    tl.move_segment(1, -1)                       # blue before red
+    out = tmp_path / "reordered.mp4"
+    args = build_ffmpeg_args(FFMPEG, tl.clips, tl.segments, str(out), mode=ExportMode.VIDEO_AND_AUDIO,
+                             preset="ultrafast")
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[-3000:]
+    assert probe(FFPROBE, str(out)).duration == pytest.approx(2.0, abs=0.1)
+    assert _is("blue", _pixel(out, 0.5, 60, 50))
+    assert _is("red", _pixel(out, 1.5, 60, 50))
+    frames = subprocess.run([FFPROBE, "-v", "error", "-count_frames", "-select_streams", "v:0",
+                             "-show_entries", "stream=nb_read_frames", "-of", "csv=p=0", str(out)],
+                            capture_output=True, text=True, check=True).stdout.strip()
+    assert int(frames) == 50

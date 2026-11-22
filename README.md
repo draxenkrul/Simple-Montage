@@ -6,6 +6,7 @@ A small Windows video editor for **cutting** and **changing speed** — nothing 
 
 - Combine several videos on one timeline, reorder or remove them
 - Split the video at the playhead, delete parts, or cut/keep an In→Out range
+- Change the order of segments: drag them on the timeline or use ◀ Move / Move ▶
 - Give every segment its own speed (0.1× – 10×), audio keeps its pitch
 - Zoom into the picture per segment (1× – 5×) and choose which part is shown
 - Adjust lighting per segment: brightness, contrast, saturation, gamma
@@ -124,6 +125,7 @@ Click a block to select it, then delete it or change its speed.
 | + / − | Preview volume up / down |
 | M | Mute / unmute preview |
 | S | Split at playhead |
+| Ctrl+← / Ctrl+→ | Move selected segment earlier / later |
 | Del | Delete selected segment or overlay |
 | I / O | Set In / Out mark |
 | X | Cut out In→Out |
@@ -136,6 +138,23 @@ Click a block to select it, then delete it or change its speed.
 | Ctrl+Shift+A | Add video to the end (combine) |
 | Ctrl+Shift+O | Add overlay video |
 | Mouse wheel on timeline | Zoom (Shift+wheel scrolls) |
+| Drag a segment | Move it to another place in the order |
+| Drag on the ruler | Scrub |
+
+## Changing the order of segments
+
+After splitting (**S**), you can move pieces around:
+
+- **Drag a segment sideways** on the timeline and drop it where a yellow *move here* line shows.
+- Or select it and click **◀ Move** / **Move ▶** (Ctrl+← / Ctrl+→), or right-click →
+  *Move this segment earlier / later*.
+
+A moved segment keeps its speed, zoom, lighting and overlays. Cut-out (striped) parts between
+segments stay where they are. Pieces taken from the same file show which part they are, e.g.
+`rgb.mp4 (6.0–9.0 s)`. Undo works as usual.
+
+To scrub (drag the playhead), drag on the time ruler or on a striped cut-out area — dragging on
+a segment moves the segment.
 
 ## Combining videos
 
@@ -184,6 +203,8 @@ export, so what you see is what you get.
    - **Show at / for / starting from its second** — when it appears, how long, and which part
      of the overlay video is used
    - **Mix in its sound** — otherwise only the main video's sound is used
+   - **Zoom into it** — zoom into the overlay's own picture (1× – 5×); drag the box in the
+     *Visible part* map to choose which part of it is shown
 5. Drag the purple block on the timeline to move it in time; **Del** removes the selected overlay.
 
 The overlay follows your edit of the main video: parts you cut out are skipped for it too, and

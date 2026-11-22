@@ -6,9 +6,10 @@ cut out of the final video. Every segment has its own speed, zoom and
 lighting. :class:`Overlay` clips are other videos shown on top of the main
 one, placed on the same source-time axis.
 
-Several videos can be combined: their files (``sources``) are laid end to
-end, so the "source time" axis runs through clip 1, then clip 2, and so on.
-A segment never crosses from one clip into the next.
+Several videos can be combined: their files are laid end to end as
+:class:`Clip` pieces, so the timeline runs through clip 1, then clip 2, and
+so on. Moving a segment rearranges these pieces. A segment never crosses from
+one clip into the next.
 
 This module has no Qt or FFmpeg dependency so it can be unit-tested directly.
 """
@@ -92,6 +93,8 @@ class Overlay:
 
     ``scale`` is its width as a fraction of the main picture width.
     ``pos_x``/``pos_y`` place it: 0 = left/top edge, 1 = right/bottom edge.
+    ``zoom``/``pan_x``/``pan_y`` zoom into the overlay's own picture, like
+    a segment's zoom.
     """
 
     path: str
@@ -106,6 +109,9 @@ class Overlay:
     pos_x: float = 0.95
     pos_y: float = 0.95
     sound: bool = False
+    zoom: float = 1.0
+    pan_x: float = 0.5
+    pan_y: float = 0.5
 
     @property
     def end(self) -> float:
@@ -123,8 +129,43 @@ class Overlay:
         return self.in_point + (t - self.start)
 
 
+@dataclass
+class Clip:
+    """A piece of a video file placed on the timeline.
+
+    At first a clip is a whole file; moving segments around cuts clips into
+    smaller pieces (``in_point`` = where in the file the piece starts).
+    """
+
+    media: MediaInfo
+    in_point: float = 0.0
+    length: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.length is None:
+            self.length = self.media.duration - self.in_point
+
+    # the file's properties, so a clip can be used where a MediaInfo was
+    path = property(lambda self: self.media.path)
+    has_audio = property(lambda self: self.media.has_audio)
+    width = property(lambda self: self.media.width)
+    height = property(lambda self: self.media.height)
+    sar = property(lambda self: self.media.sar)
+    fps = property(lambda self: self.media.fps)
+    fps_text = property(lambda self: self.media.fps_text)
+
+    @property
+    def duration(self) -> float:
+        """Length on the timeline."""
+        return self.length
+
+    @property
+    def whole_file(self) -> bool:
+        return self.in_point < 1e-6 and abs(self.length - self.media.duration) < 1e-6
+
+
 class Timeline:
-    """Kept segments of one source video, with undo/redo."""
+    """Kept segments of one or more combined videos, with undo/redo."""
 
     def __init__(self, duration: float = 0.0, fps: float = 30.0) -> None:
         self.reset(duration, fps)
@@ -132,7 +173,7 @@ class Timeline:
     # ------------------------------------------------------------------ setup
     def reset(self, duration: float, fps: float, sources: list[MediaInfo] | None = None) -> None:
         """Start over with the whole source kept as a single segment."""
-        self.sources: list[MediaInfo] = list(sources or [])
+        self.clips: list[Clip] = [Clip(m) for m in sources or []]
         self.duration = max(0.0, float(duration))
         self.fps = float(fps) if fps and fps > 0 else 30.0
         self.segments: list[Segment] = (
@@ -152,42 +193,42 @@ class Timeline:
     # ------------------------------------------------------- combined clips
     @property
     def clip_offsets(self) -> list[float]:
-        """Where each source clip starts on the timeline."""
+        """Where each clip starts on the timeline."""
         offsets, t = [], 0.0
-        for src in self.sources:
+        for clip in self.clips:
             offsets.append(t)
-            t += src.duration
+            t += clip.length
         return offsets
 
     def clip_at(self, t: float) -> int | None:
-        """Index of the source clip at timeline time ``t``."""
-        for k, (offset, src) in enumerate(zip(self.clip_offsets, self.sources)):
-            if offset <= t < offset + src.duration:
+        """Index of the clip at timeline time ``t``."""
+        for k, (offset, clip) in enumerate(zip(self.clip_offsets, self.clips)):
+            if offset <= t < offset + clip.length:
                 return k
-        return len(self.sources) - 1 if self.sources and t >= self.duration else None
+        return len(self.clips) - 1 if self.clips and t >= self.duration else None
 
     def append_clip(self, info: MediaInfo) -> int:
         """Add a video to the end of the timeline. Returns its clip index."""
         self._checkpoint()
         start = self.duration
-        self.sources.append(info)
+        self.clips.append(Clip(info))
         self.duration += info.duration
         self.segments.append(Segment(start, start + info.duration))
-        return len(self.sources) - 1
+        return len(self.clips) - 1
 
     def remove_clip(self, k: int) -> bool:
-        """Take a video off the timeline; later clips move up to close the gap."""
-        if not 0 <= k < len(self.sources) or len(self.sources) < 2:
+        """Take a clip off the timeline; later clips move up to close the gap."""
+        if not 0 <= k < len(self.clips) or len(self.clips) < 2:
             return False
         self._checkpoint()
         a = self.clip_offsets[k]
-        b = a + self.sources[k].duration
+        b = a + self.clips[k].length
         d = b - a
-        self.segments = [self._shifted(seg, -d if seg.start >= b else 0.0)
-                         for seg in self.segments if not (seg.start >= a and seg.end <= b + 1e-9)]
+        self.segments = [self._shifted(seg, -d if seg.start >= b - 1e-9 else 0.0)
+                         for seg in self.segments if not (seg.start >= a - 1e-9 and seg.end <= b + 1e-9)]
         self.overlays = [replace(ov, start=ov.start - d if ov.start >= b else ov.start)
                          for ov in self.overlays if not a <= ov.start < b]
-        del self.sources[k]
+        del self.clips[k]
         self.duration -= d
         for ov in self.overlays:
             self._clamp_overlay(ov)
@@ -196,32 +237,100 @@ class Timeline:
     def move_clip(self, k: int, step: int) -> bool:
         """Move clip ``k`` earlier (step -1) or later (+1), with its edits and overlays."""
         j = k + step
-        if not (0 <= k < len(self.sources) and 0 <= j < len(self.sources)):
+        if not (0 <= k < len(self.clips) and 0 <= j < len(self.clips)):
             return False
         self._checkpoint()
-        old_offsets = self.clip_offsets
-        order = list(range(len(self.sources)))
-        order[k], order[j] = order[j], order[k]
-        new_sources = [self.sources[i] for i in order]
-        new_offset_of, t = {}, 0.0
+        lo = min(k, j)
+        offsets = self.clip_offsets
+        first = (offsets[lo], offsets[lo] + self.clips[lo].length)
+        second = (first[1], first[1] + self.clips[lo + 1].length)
+        self._rearrange([first, second], [1, 0])
+        return True
+
+    # ------------------------------------------------------ moving segments
+    def move_segment(self, index: int, step: int) -> int | None:
+        """Move a segment one place earlier (-1) or later (+1).
+
+        Swaps it with the neighbouring segment; a cut-out gap between them
+        stays where it is. Returns the segment's new index, or None.
+        """
+        if not (0 <= index < len(self.segments) and 0 <= index + step < len(self.segments)):
+            return None
+        self._checkpoint()
+        return self._move_segment_step(index, step)
+
+    def move_segment_to(self, index: int, target: int) -> int | None:
+        """Move a segment to position ``target`` in the order (one undo step)."""
+        if not (0 <= index < len(self.segments) and 0 <= target < len(self.segments)) or index == target:
+            return None
+        self._checkpoint()
+        step = 1 if target > index else -1
+        while index != target:
+            index = self._move_segment_step(index, step)
+        return index
+
+    def _move_segment_step(self, index: int, step: int) -> int:
+        lo = min(index, index + step)
+        a, b = self.segments[lo], self.segments[lo + 1]
+        ranges = [(a.start, a.end)]
+        if b.start - a.end > 1e-9:
+            ranges.append((a.end, b.start))       # the cut-out gap stays in the middle
+        ranges.append((b.start, b.end))
+        order = list(range(len(ranges)))[::-1]
+        self._rearrange(ranges, order)
+        return index + step
+
+    # ------------------------------------------------------------- helpers
+    def _split_clip_at(self, t: float) -> None:
+        """Cut the clip under ``t`` into two pieces (no-op at a clip edge)."""
+        for k, (offset, clip) in enumerate(zip(self.clip_offsets, self.clips)):
+            local = t - offset
+            if 1e-6 < local < clip.length - 1e-6:
+                self.clips[k:k + 1] = [
+                    replace(clip, length=local),
+                    replace(clip, in_point=clip.in_point + local, length=clip.length - local),
+                ]
+                return
+
+    def _rearrange(self, ranges: list[tuple[float, float]], order: list[int]) -> None:
+        """Put adjacent timeline ranges in a new ``order``.
+
+        Clips are cut at the range edges; segments and overlays move with the
+        range they start in. No undo checkpoint (callers make one).
+        """
+        for a, b in ranges:
+            self._split_clip_at(a)
+            self._split_clip_at(b)
+        start, stop = ranges[0][0], ranges[-1][1]
+        new_start, t = {}, start
         for i in order:
-            new_offset_of[i] = t
-            t += self.sources[i].duration
-        shift = {i: new_offset_of[i] - old_offsets[i] for i in range(len(self.sources))}
+            new_start[i] = t
+            t += ranges[i][1] - ranges[i][0]
 
-        def clip_of(t: float) -> int:
-            for i in range(len(self.sources) - 1, -1, -1):
-                if t >= old_offsets[i] - 1e-9:
+        def which(x: float) -> int | None:
+            for i, (a, b) in enumerate(ranges):
+                if a - 1e-9 <= x < b - 1e-9:
                     return i
-            return 0
+            return None
 
-        self.segments = sorted((self._shifted(seg, shift[clip_of(seg.start)]) for seg in self.segments),
+        def mapped(x: float) -> float:
+            i = which(x)
+            return x if i is None else x - ranges[i][0] + new_start[i]
+
+        before, after, inside = [], [], {i: [] for i in range(len(ranges))}
+        for offset, clip in zip(self.clip_offsets, self.clips):
+            if offset < start - 1e-9:
+                before.append(clip)
+            elif offset >= stop - 1e-9:
+                after.append(clip)
+            else:
+                inside[which(offset)].append(clip)
+        self.clips = before + [c for i in order for c in inside[i]] + after
+        self.segments = sorted((self._shifted(seg, mapped(seg.start) - seg.start) for seg in self.segments),
                                key=lambda seg: seg.start)
-        self.overlays = [replace(ov, start=ov.start + shift[clip_of(ov.start)]) for ov in self.overlays]
-        self.sources = new_sources
+        self.overlays = [replace(ov, start=mapped(ov.start)) for ov in self.overlays]
         for ov in self.overlays:
             self._clamp_overlay(ov)
-        return True
 
     @staticmethod
     def _shifted(seg: Segment, d: float) -> Segment:
@@ -458,6 +567,9 @@ class Timeline:
         ov.scale = min(max(ov.scale, MIN_OVERLAY_SCALE), MAX_OVERLAY_SCALE)
         ov.pos_x = min(max(ov.pos_x, 0.0), 1.0)
         ov.pos_y = min(max(ov.pos_y, 0.0), 1.0)
+        ov.zoom = min(max(ov.zoom, MIN_ZOOM), MAX_ZOOM)
+        ov.pan_x = min(max(ov.pan_x, 0.0), 1.0)
+        ov.pan_y = min(max(ov.pan_y, 0.0), 1.0)
         ov.sound = bool(ov.sound) and ov.has_audio
 
     def overlay_at(self, t: float) -> int | None:
@@ -494,7 +606,7 @@ class Timeline:
         self._last_op = op
 
     def _snapshot(self) -> tuple:
-        return copy.deepcopy((self.segments, self.overlays, self.sources, self.duration))
+        return copy.deepcopy((self.segments, self.overlays, self.clips, self.duration))
 
     @property
     def can_undo(self) -> bool:
@@ -508,7 +620,7 @@ class Timeline:
         if not self._undo:
             return False
         self._redo.append(self._snapshot())
-        self.segments, self.overlays, self.sources, self.duration = self._undo.pop()
+        self.segments, self.overlays, self.clips, self.duration = self._undo.pop()
         self._last_op = None
         return True
 
@@ -516,6 +628,6 @@ class Timeline:
         if not self._redo:
             return False
         self._undo.append(self._snapshot())
-        self.segments, self.overlays, self.sources, self.duration = self._redo.pop()
+        self.segments, self.overlays, self.clips, self.duration = self._redo.pop()
         self._last_op = None
         return True

@@ -10,8 +10,10 @@ Once the video is split or cut, every kept segment shows a small export (⬇)
 button. Right-click opens a menu to export a segment, all segments, or a
 cut-out part.
 
-Mouse: click/drag to seek and select a segment, click an overlay to select it
-and drag it to move it in time, wheel to zoom, Shift+wheel to scroll.
+Mouse: click to seek and select a segment; drag a segment sideways to move
+it to another place in the order; drag on the ruler or a cut-out area to
+scrub; click an overlay to select it and drag it to move it in time; wheel
+to zoom, Shift+wheel to scroll.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ class TimelineWidget(QWidget):
     export_segment_requested = Signal(int)
     export_all_requested = Signal()
     export_cut_requested = Signal(float, float)  # a cut-out part: start, end
+    segment_move_requested = Signal(int, int)  # segment index, new position
     add_clip_requested = Signal()
     move_clip_requested = Signal(int, int)  # clip index, -1 earlier / +1 later
     remove_clip_requested = Signal(int)
@@ -70,6 +73,8 @@ class TimelineWidget(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMouseTracking(True)  # for the export button's hover state
         self._hover_export = -1
+        self._press_segment: tuple[int, float] | None = None  # (index, press x)
+        self._reorder_target: int | None = None               # while dragging a segment
 
     # ------------------------------------------------------------ public API
     def reset_view(self) -> None:
@@ -199,6 +204,7 @@ class TimelineWidget(QWidget):
         self._paint_clip_boundaries(p, track)
         self._paint_overlays(p)
         self._paint_marks(p, track)
+        self._paint_reorder(p, track)
 
         x = self._x(self._playhead)
         p.setPen(QPen(COL_PLAYHEAD, 2))
@@ -224,10 +230,32 @@ class TimelineWidget(QWidget):
             p.drawText(int(x) + 3, RULER_H - 8, label)
             t += step
 
-    def _paint_clip_boundaries(self, p: QPainter, track: QRectF) -> None:
-        if len(self._tl.sources) < 2:
+    def _drop_target(self, x: float) -> int:
+        """Where the dragged segment would go if dropped at ``x``."""
+        index = self._press_segment[0]
+        t = self._t(x)
+        others = [seg for i, seg in enumerate(self._tl.segments) if i != index]
+        return sum(1 for seg in others if (seg.start + seg.end) / 2 < t)
+
+    def _paint_reorder(self, p: QPainter, track: QRectF) -> None:
+        if self._reorder_target is None or self._press_segment is None:
             return
-        for k, (offset, src) in enumerate(zip(self._tl.clip_offsets, self._tl.sources)):
+        index, target = self._press_segment[0], self._reorder_target
+        shade = QColor(0, 0, 0, 140)
+        p.fillRect(self._segment_rect(index), shade)
+        others = [seg for i, seg in enumerate(self._tl.segments) if i != index]
+        x = self._x(others[0].start if target == 0 else others[target - 1].end)
+        x = min(max(x, 2.0), self.width() - 2.0)  # keep the marker visible at the edges
+        p.setPen(QPen(COL_MARK, 4))
+        p.drawLine(QPointF(x, track.top() - 6), QPointF(x, track.bottom() + 6))
+        p.setPen(COL_MARK)
+        label = "move here" if target != index else "same place"
+        p.drawText(QPointF(min(x + 6, self.width() - 80), track.bottom() - 6), label)
+
+    def _paint_clip_boundaries(self, p: QPainter, track: QRectF) -> None:
+        if len(self._tl.clips) < 2:
+            return
+        for k, (offset, src) in enumerate(zip(self._tl.clip_offsets, self._tl.clips)):
             x = self._x(offset)
             if k > 0:
                 p.setPen(QPen(QColor("#ffffff"), 2, Qt.PenStyle.DashLine))
@@ -235,6 +263,8 @@ class TimelineWidget(QWidget):
             width = self._x(offset + src.duration) - x
             if width > 50:
                 name = f"{k + 1}. {Path(src.path).name}"
+                if not src.whole_file:  # a piece of the file: say which part
+                    name += f" ({src.in_point:.1f}–{src.in_point + src.length:.1f} s)"
                 text = p.fontMetrics().elidedText(name, Qt.TextElideMode.ElideMiddle, int(width) - 40)
                 tw = p.fontMetrics().horizontalAdvance(text) + 8
                 label = QRectF(max(x, 0) + 4, track.top() + 3, tw, p.fontMetrics().height() + 2)
@@ -301,9 +331,13 @@ class TimelineWidget(QWidget):
                     self._drag_overlay = (i, self._t(pos.x()) - self._tl.overlays[i].start)
                     self.overlay_clicked.emit(i)
                     return
-            self._dragging = True
             t = self._t(event.position().x())
             index = self._tl.index_at(t)
+            on_block = index is not None and self._segment_rect(index).contains(pos)
+            if on_block and len(self._tl.segments) > 1:
+                self._press_segment = (index, pos.x())   # may become a reorder drag
+            else:
+                self._dragging = True                     # scrub
             self.segment_clicked.emit(-1 if index is None else index)
             self.seek_requested.emit(t)
 
@@ -320,10 +354,23 @@ class TimelineWidget(QWidget):
         if self._drag_overlay is not None:
             i, offset = self._drag_overlay
             self.overlay_moved.emit(i, self._t(event.position().x()) - offset)
+        elif self._press_segment is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            if self._reorder_target is not None or abs(event.position().x() - self._press_segment[1]) > 8:
+                self._reorder_target = self._drop_target(event.position().x())
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                self.update()
         elif self._dragging:
             self.seek_requested.emit(self._t(event.position().x()))
 
     def mouseReleaseEvent(self, _event) -> None:  # noqa: N802
+        if self._press_segment is not None and self._reorder_target is not None:
+            index, target = self._press_segment[0], self._reorder_target
+            self._press_segment, self._reorder_target = None, None
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            self.update()
+            if target != index:
+                self.segment_move_requested.emit(index, target)
+        self._press_segment, self._reorder_target = None, None
         self._dragging = False
         self._drag_overlay = None
 
@@ -343,6 +390,13 @@ class TimelineWidget(QWidget):
             seg = self._tl.segments[index]
             menu.addAction(f"Export this segment ({format_time(seg.start)} – {format_time(seg.end)})…",
                            lambda: self.export_segment_requested.emit(index))
+            if len(self._tl.segments) > 1:
+                earlier = menu.addAction("Move this segment earlier",
+                                         lambda: self.segment_move_requested.emit(index, index - 1))
+                earlier.setEnabled(index > 0)
+                later = menu.addAction("Move this segment later",
+                                       lambda: self.segment_move_requested.emit(index, index + 1))
+                later.setEnabled(index < len(self._tl.segments) - 1)
         else:
             gap = self._tl.gap_at(t)
             if gap is not None:
@@ -354,12 +408,12 @@ class TimelineWidget(QWidget):
         menu.addSeparator()
         menu.addAction("Add a video to the end…", self.add_clip_requested.emit)
         k = self._tl.clip_at(t)
-        if k is not None and len(self._tl.sources) > 1:
-            name = Path(self._tl.sources[k].path).name
+        if k is not None and len(self._tl.clips) > 1:
+            name = Path(self._tl.clips[k].path).name
             earlier = menu.addAction(f"Move clip “{name}” earlier", lambda: self.move_clip_requested.emit(k, -1))
             earlier.setEnabled(k > 0)
             later = menu.addAction(f"Move clip “{name}” later", lambda: self.move_clip_requested.emit(k, 1))
-            later.setEnabled(k < len(self._tl.sources) - 1)
+            later.setEnabled(k < len(self._tl.clips) - 1)
             menu.addAction(f"Remove clip “{name}” from the timeline", lambda: self.remove_clip_requested.emit(k))
         menu.exec(event.globalPos())
 

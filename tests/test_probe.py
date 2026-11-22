@@ -44,3 +44,11 @@ def test_parse_sample_aspect_ratio():
     assert parse_ffprobe_json("a", {"streams": [dict(base, sample_aspect_ratio="4:3")], "format": fmt}).sar == "4/3"
     assert parse_ffprobe_json("a", {"streams": [dict(base, sample_aspect_ratio="0:1")], "format": fmt}).sar == "1/1"
     assert parse_ffprobe_json("a", {"streams": [base], "format": fmt}).sar == "1/1"
+
+
+
+def test_duration_prefers_the_video_stream():
+    data = {"streams": [{"codec_type": "video", "avg_frame_rate": "25/1", "duration": "3.000"},
+                        {"codec_type": "audio", "duration": "3.021"}],
+            "format": {"duration": "3.021"}}
+    assert parse_ffprobe_json("a.mp4", data).duration == 3.0

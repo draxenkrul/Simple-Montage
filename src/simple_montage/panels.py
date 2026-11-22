@@ -21,7 +21,15 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from simple_montage.model import LIGHT_RANGES, MAX_OVERLAY_SCALE, MIN_OVERLAY_SCALE, Overlay, Segment
+from simple_montage.model import (
+    LIGHT_RANGES,
+    MAX_OVERLAY_SCALE,
+    MAX_ZOOM,
+    MIN_OVERLAY_SCALE,
+    MIN_ZOOM,
+    Overlay,
+    Segment,
+)
 from simple_montage.timecode import format_time
 from simple_montage.zoom_navigator import ZoomNavigator
 
@@ -144,6 +152,24 @@ class OverlayPanel(QWidget):
         self.sound_check.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.sound_check.toggled.connect(lambda on: self.overlay_changed.emit({"sound": on}))
 
+        self.zoom_spin = QDoubleSpinBox()
+        self.zoom_spin.setRange(MIN_ZOOM, MAX_ZOOM)
+        self.zoom_spin.setSingleStep(0.1)
+        self.zoom_spin.setDecimals(2)
+        self.zoom_spin.setSuffix("×")
+        self.zoom_spin.setKeyboardTracking(False)
+        self.zoom_spin.setToolTip("Zoom into the overlay video's own picture")
+        self.zoom_spin.valueChanged.connect(lambda z: self.overlay_changed.emit({"zoom": z}))
+        self.zoom_buttons = []
+        for z in (1.0, 1.5, 2.0, 3.0):
+            btn = _button(f"{z:g}×", f"Zoom into the overlay {z:g}×")
+            btn.clicked.connect(lambda _=False, z=z: self.overlay_changed.emit({"zoom": z}))
+            self.zoom_buttons.append(btn)
+        self.zoom_map = ZoomNavigator()
+        self.zoom_map.setToolTip("Which part of the overlay video is shown when zoomed.\n"
+                                 "Drag the box; double-click to centre.")
+        self.zoom_map.view_changed.connect(lambda x, y: self.overlay_changed.emit({"pan_x": x, "pan_y": y}))
+
         self.map = ZoomNavigator()
         self.map.setToolTip("Drag the box to place the overlay. Double-click to centre.")
         self.map.view_changed.connect(lambda x, y: self.overlay_changed.emit({"pos_x": x, "pos_y": y}))
@@ -175,17 +201,35 @@ class OverlayPanel(QWidget):
         look.addSpacing(12)
         look.addWidget(self.sound_check)
 
+        zoom = QHBoxLayout()
+        zoom.addWidget(QLabel("Zoom into it"))
+        zoom.addWidget(self.zoom_spin)
+        for btn in self.zoom_buttons:
+            zoom.addWidget(btn)
+        zoom.addStretch()
+
         left = QVBoxLayout()
         left.addLayout(top)
         left.addLayout(timing)
         left.addLayout(look)
+        left.addLayout(zoom)
         self.hint = _hint("Tip: drag the purple block on the timeline to move the overlay in time.")
         left.addWidget(self.hint)
+
+        def captioned(widget: QWidget, caption: str) -> QVBoxLayout:
+            box = QVBoxLayout()
+            label = QLabel(caption)
+            label.setStyleSheet("color: gray;")
+            box.addWidget(label, alignment=Qt.AlignmentFlag.AlignHCenter)
+            box.addWidget(widget)
+            box.addStretch()
+            return box
 
         layout = QHBoxLayout(self)
         layout.addLayout(left, stretch=1)
         layout.addLayout(corners)
-        layout.addWidget(self.map)
+        layout.addLayout(captioned(self.map, "Position"))
+        layout.addLayout(captioned(self.zoom_map, "Visible part"))
         self.set_overlay(None, 16 / 9, 0.0)
 
     @staticmethod
@@ -205,7 +249,8 @@ class OverlayPanel(QWidget):
 
     def set_overlay(self, ov: Overlay | None, main_aspect: float, main_duration: float) -> None:
         widgets = [self.delete_button, self.start_spin, self.in_spin, self.length_spin,
-                   self.size_slider, self.sound_check, self.map, *self.corner_buttons]
+                   self.size_slider, self.sound_check, self.map, *self.corner_buttons,
+                   self.zoom_spin, self.zoom_map, *self.zoom_buttons]
         for w in widgets:
             w.setEnabled(ov is not None)
             w.blockSignals(True)
@@ -213,6 +258,7 @@ class OverlayPanel(QWidget):
         if ov is None:
             self.name_label.setText("Select a purple overlay block on the timeline, or add one.")
             self.map.set_box(1.0, 1.0, 0.5, 0.5)
+            self.zoom_map.set_view(1.0, 0.5, 0.5)
             self.size_label.setText("")
         else:
             self.name_label.setText(
@@ -230,5 +276,8 @@ class OverlayPanel(QWidget):
             self.sound_check.setText("Mix in its sound" if ov.has_audio else "No sound in this video")
             height = ov.scale * main_aspect / ov.aspect
             self.map.set_box(ov.scale, height, ov.pos_x, ov.pos_y)
+            self.zoom_spin.setValue(ov.zoom)
+            self.zoom_map.set_aspect(ov.aspect)
+            self.zoom_map.set_view(ov.zoom, ov.pan_x, ov.pan_y)
         for w in widgets:
             w.blockSignals(False)

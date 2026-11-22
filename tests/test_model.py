@@ -223,7 +223,7 @@ def test_append_clip_extends_the_timeline():
     assert spans(tl)[-1] == (10.0, 15.0, 1.0)
     assert tl.clip_at(12) == 1 and tl.clip_at(3) == 0
     tl.undo()
-    assert tl.duration == 10 and len(tl.sources) == 1
+    assert tl.duration == 10 and len(tl.clips) == 1
 
 
 def test_move_clip_takes_edits_and_overlays_along():
@@ -233,11 +233,11 @@ def test_move_clip_takes_edits_and_overlays_along():
     tl.set_speed(2, 2.0)
     tl.add_overlay(_overlay(start=11.0, length=1.0))
     assert tl.move_clip(1, -1)        # b first
-    assert [s.path for s in tl.sources] == ["b.mp4", "a.mp4"]
+    assert [s.path for s in tl.clips] == ["b.mp4", "a.mp4"]
     assert spans(tl) == [(0.0, 2.0, 1.0), (2.0, 4.0, 2.0), (4.0, 14.0, 1.0)]
     assert tl.overlays[0].start == pytest.approx(1.0)
     tl.undo()
-    assert [s.path for s in tl.sources] == ["a.mp4", "b.mp4"] and tl.overlays[0].start == 11.0
+    assert [s.path for s in tl.clips] == ["a.mp4", "b.mp4"] and tl.overlays[0].start == 11.0
 
 
 def test_remove_clip_closes_the_gap():
@@ -247,7 +247,7 @@ def test_remove_clip_closes_the_gap():
     tl.add_overlay(_overlay(start=11.0, length=1.0))   # on b: removed with it
     tl.add_overlay(_overlay(start=15.0, length=1.0))   # on c: moves up
     assert tl.remove_clip(1)
-    assert tl.duration == 16 and [s.path for s in tl.sources] == ["a.mp4", "c.mp4"]
+    assert tl.duration == 16 and [s.path for s in tl.clips] == ["a.mp4", "c.mp4"]
     assert spans(tl) == [(0.0, 10.0, 1.0), (10.0, 16.0, 1.0)]
     assert [ov.start for ov in tl.overlays] == [pytest.approx(11.0)]
     assert not tl.remove_clip(5)
@@ -256,3 +256,50 @@ def test_remove_clip_closes_the_gap():
 def test_cannot_remove_the_only_clip():
     tl = Timeline.from_media(_media("a.mp4", 10))
     assert not tl.remove_clip(0)
+
+
+def test_move_segment_reorders_and_keeps_its_settings():
+    tl = Timeline.from_media(_media("a.mp4", 9))
+    tl.split(3); tl.split(6)                     # A 0-3, B 3-6, C 6-9
+    tl.set_speed(2, 2.0)                         # C at 2x
+    assert tl.move_segment(2, -1) == 1           # A C B
+    assert spans(tl) == [(0.0, 3.0, 1.0), (3.0, 6.0, 2.0), (6.0, 9.0, 1.0)]
+    assert [(c.in_point, c.length) for c in tl.clips] == [(0.0, 3.0), (6.0, 3.0), (3.0, 3.0)]
+    assert tl.move_segment(1, -1) == 0           # C A B
+    assert [c.in_point for c in tl.clips] == [6.0, 0.0, 3.0]
+    tl.undo()
+    assert [c.in_point for c in tl.clips] == [0.0, 6.0, 3.0]
+    assert tl.move_segment(0, -1) is None and tl.move_segment(2, 1) is None
+
+
+def test_move_segment_keeps_cut_out_gap_in_place():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    tl.delete_range(3, 5)                        # A 0-3, gap 3-5, B 5-10
+    assert tl.move_segment(1, -1) == 0           # B, gap, A
+    assert spans(tl) == [(0.0, 5.0, 1.0), (7.0, 10.0, 1.0)]
+    assert [(c.in_point, c.length) for c in tl.clips] == [(5.0, 5.0), (3.0, 2.0), (0.0, 3.0)]
+    assert tl.gap_at(6.0) == (5.0, 7.0) and tl.output_duration == 8.0
+
+
+def test_move_segment_to_is_one_undo_step():
+    tl = Timeline.from_media(_media("a.mp4", 8))
+    for t in (2, 4, 6):
+        tl.split(t)                              # 0-2 2-4 4-6 6-8
+    assert tl.move_segment_to(3, 0) == 0
+    assert [c.in_point for c in tl.clips] == [6.0, 0.0, 2.0, 4.0]
+    tl.undo()
+    assert len(tl.clips) == 1 and tl.clips[0].whole_file
+
+
+def test_overlay_moves_with_its_segment():
+    tl = Timeline.from_media(_media("a.mp4", 10))
+    tl.split(5)
+    tl.add_overlay(_overlay(start=6.0, length=1.0))   # on the second segment
+    tl.move_segment(1, -1)
+    assert tl.overlays[0].start == pytest.approx(1.0)
+
+
+def test_overlay_zoom_is_clamped():
+    tl = Timeline(10.0, 25)
+    tl.add_overlay(_overlay(start=0, length=2, zoom=9, pan_x=3))
+    assert (tl.overlays[0].zoom, tl.overlays[0].pan_x) == (5.0, 1.0)

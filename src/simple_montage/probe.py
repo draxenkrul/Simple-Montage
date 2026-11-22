@@ -47,7 +47,8 @@ def parse_ffprobe_json(path: str, data: dict) -> MediaInfo:
         or _parse_rate(video.get("r_frame_rate"))
         or Fraction(30)
     )
-    duration = data.get("format", {}).get("duration") or video.get("duration")
+    # the picture's own length: the container's can include longer audio
+    duration = video.get("duration") or data.get("format", {}).get("duration")
     try:
         duration = float(duration)
     except (TypeError, ValueError):

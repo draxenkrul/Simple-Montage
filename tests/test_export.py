@@ -35,12 +35,15 @@ def test_boundary_sits_half_a_frame_early():
 
 
 def test_filter_graph_with_audio():
-    graph = build_filter_graph([Segment(0, 4, 2.0), Segment(6, 10, 1.0)], info())
+    from simple_montage.export import build_export
+    inputs, graph = build_export([Segment(0, 4, 2.0), Segment(6, 10, 1.0)], info())
+    # each piece reads only its part of the file; the last one runs to the end
+    assert inputs == [["-t", "3.98", "-i", "in.mp4"], ["-ss", "5.98", "-i", "in.mp4"]]
     assert graph == (
-        "[0:v:0]trim=end=3.98,setpts=(PTS-STARTPTS)/2[v0];"
-        "[0:a:0]atrim=end=3.98,asetpts=PTS-STARTPTS,atempo=2[a0];"
-        "[0:v:0]trim=start=5.98,setpts=PTS-STARTPTS[v1];"
-        "[0:a:0]atrim=start=5.98,asetpts=PTS-STARTPTS[a1];"
+        "[0:v:0]setpts=(PTS-STARTPTS)/2[v0];"
+        "[0:a:0]asetpts=PTS-STARTPTS,atempo=2,atrim=duration=2,apad=whole_dur=2[a0];"
+        "[1:v:0]setpts=PTS-STARTPTS[v1];"
+        "[1:a:0]asetpts=PTS-STARTPTS,atrim=duration=4,apad=whole_dur=4[a1];"
         "[v0][a0][v1][a1]concat=n=2:v=1:a=1[cv][aout];"
         "[cv]fps=25/1,format=yuv420p[vout]"
     )
@@ -71,9 +74,11 @@ def test_parse_progress_line():
 
 
 def test_filter_graph_audio_only():
-    from simple_montage.export import ExportMode
-    graph = build_filter_graph([Segment(5, 10, 1.0)], info(duration=20.0), ExportMode.AUDIO_ONLY)
-    assert graph == "[0:a:0]atrim=start=4.98:end=9.98,asetpts=PTS-STARTPTS[a0];[a0]concat=n=1:v=0:a=1[aout]"
+    from simple_montage.export import ExportMode, build_export
+    inputs, graph = build_export([Segment(5, 10, 1.0)], info(duration=20.0), ExportMode.AUDIO_ONLY)
+    assert inputs == [["-ss", "4.98", "-t", "5", "-i", "in.mp4"]]
+    assert graph == ("[0:a:0]asetpts=PTS-STARTPTS,atrim=duration=5,apad=whole_dur=5[a0];"
+                     "[a0]concat=n=1:v=0:a=1[aout]")
 
 
 def test_filter_graph_video_only_has_no_audio():
@@ -120,9 +125,10 @@ def test_overlay_inputs_and_graph():
     segs = [Segment(0, 5), Segment(5, 10, speed=2.0)]
     inputs, graph = build_export(segs, info(), overlays=[ov])
     # overlay main 3-7: 3-5 in segment 0, 5-7 in segment 1 (file 1-3 and 3-5)
-    assert inputs == [["-ss", "1", "-t", "2", "-i", "pip.mp4"], ["-ss", "3", "-t", "2", "-i", "pip.mp4"]]
+    assert inputs == [["-t", "4.98", "-i", "in.mp4"], ["-ss", "1", "-t", "2", "-i", "pip.mp4"],
+                      ["-ss", "4.98", "-i", "in.mp4"], ["-ss", "3", "-t", "2", "-i", "pip.mp4"]]
     assert "[1:v:0]setpts=(PTS-STARTPTS)/1+3/TB,scale=480:-2:flags=lanczos[ov0_0]" in graph
-    assert "[2:v:0]setpts=(PTS-STARTPTS)/2+0/TB" in graph
+    assert "[3:v:0]setpts=(PTS-STARTPTS)/2+0/TB" in graph
     assert "enable='between(t,0,1)'" in graph            # 2 s at 2x -> first second of segment 1
     assert "overlay=x=(main_w-overlay_w)*1:y=(main_h-overlay_h)*0" in graph
     assert "adelay=3000:all=1" in graph and "amix=inputs=2:duration=first:normalize=0[a0]" in graph
@@ -143,9 +149,9 @@ def test_combined_clips_use_their_own_inputs_and_local_times():
     b = MediaInfo("b.mp4", 4.0, 25.0, "25/1", 640, 480, False)
     # one segment crossing the clip boundary (8-12) is split into 8-10 (a) and 0-2 (b)
     inputs, graph = build_export([Segment(8, 12)], [a, b])
-    assert inputs == [["-i", "b.mp4"]]
-    assert "[0:v:0]trim=start=7.98,setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease" in graph
-    assert "[1:v:0]trim=end=1.98,setpts=PTS-STARTPTS,scale=1920:1080" in graph and "pad=1920:1080" in graph
+    assert inputs == [["-ss", "7.98", "-i", "a.mp4"], ["-t", "1.98", "-i", "b.mp4"]]
+    assert "[0:v:0]setpts=PTS-STARTPTS,scale=1920:1080:force_original_aspect_ratio=decrease" in graph
+    assert "[1:v:0]setpts=PTS-STARTPTS,scale=1920:1080" in graph and "pad=1920:1080" in graph
     assert "anullsrc=r=48000:cl=stereo,atrim=duration=2[a1]" in graph     # b has no sound
     assert "concat=n=2:v=1:a=1" in graph
 
@@ -153,4 +159,21 @@ def test_combined_clips_use_their_own_inputs_and_local_times():
 def test_same_size_clips_are_not_rescaled():
     a = MediaInfo("a.mp4", 10.0, 25.0, "25/1", 1920, 1080, True)
     b = MediaInfo("b.mp4", 4.0, 25.0, "25/1", 1920, 1080, True)
-    assert "pad=" not in build_filter_graph([Segment(0, 14)], [a, b])
+    assert ",pad=" not in build_filter_graph([Segment(0, 14)], [a, b])
+
+
+
+def test_clip_pieces_read_from_their_in_point():
+    from simple_montage.export import build_export
+    from simple_montage.model import Clip
+    a = MediaInfo("a.mp4", 10.0, 25.0, "25/1", 1920, 1080, True)
+    clips = [Clip(a, in_point=6.0, length=4.0), Clip(a, in_point=0.0, length=6.0)]   # 6-10 then 0-6
+    inputs, _graph = build_export([Segment(0, 4), Segment(4, 10)], clips)
+    assert inputs == [["-ss", "5.98", "-i", "a.mp4"], ["-t", "5.98", "-i", "a.mp4"]]
+
+
+def test_overlay_zoom_crops_before_scaling():
+    from simple_montage.model import Overlay
+    ov = Overlay("pip.mp4", 8.0, 640, 360, False, start=0.0, length=2.0, zoom=2.0, pan_x=1.0, pan_y=0.0)
+    graph = build_filter_graph([Segment(0, 10)], info(), overlays=[ov])
+    assert "crop=w=iw/2:h=ih/2:x=(iw-iw/2)*1:y=(ih-ih/2)*0,scale=672:-2" in graph
